@@ -8,7 +8,7 @@ A model viewer and editor for Godzilla: Unleashed `.BDG` shape files. View, edit
 
 ### Pre-built Release
 
-Download the latest `.exe` from the [Releases](https://github.com/Digitzaki/Unleashed-Kaiju-Editor/releases/tag/Indev) tab. No additional setup required — just run it.
+Download the latest `.exe` from the [Releases](https://github.com/Digitzaki/Unleashed-Kaiju-Editor/releases/tag/Indev) tab. No additional setup required - just run it.
 
 ### Running from Source
 
