@@ -7,7 +7,7 @@ import re
 import sys
 import json
 import math
-import struct  # used by inline encoders
+import struct
 import shutil
 import subprocess
 from pathlib import Path
@@ -62,15 +62,8 @@ TEXTURE_SUFFIXES = {
     'S': 'Decal/Shader Texture',
 }
 
-# Map resource (graphic) size -> (format, width, height). These are the sizes the
-# original extractor uses to recognize the four standard kaiju textures.
 SIZE_TO_FORMAT = {
     0x2aac0: ('CMPR', 512, 512),
-    # 0xaaaa0 / 0x2aaa0 are RGB5A3 mip chains (512^2 and 256^2 respectively).
-    # Mecha's _B map happens to land on 0xaaaa0 too and was previously
-    # mis-tagged RGB565; the viewer force-grayscales _B so it never showed,
-    # but Gigan/JetJaguar/SpaceGodzilla put _C/_M/_S/_B on these sizes and
-    # the wrong format produced the noisy red/green output.
     0xaaaa0: ('RGB5A3', 512, 512),
     0x2aaa0: ('RGB5A3', 256, 256),
     0x15560: ('I8', 256, 256),
@@ -84,11 +77,7 @@ def load_mesh_from_bdg(shape_path: Path):
     _, _, skeleton = bdg.find_skeleton(D, strings)
     bone_count = max(skeleton) + 1
 
-    # Compute global bone positions (and parent links) for the optional
-    # skeleton overlay. Process bones in hierarchical (BFS) order from the
-    # root so a child is never resolved before its parent — iterating in
-    # raw index order would mis-place bones whose parent index is higher
-    # than their own (yielding stray cross-body edges).
+    # BFS from root so children are resolved after their parents.
     bone_globals: list[list[list[float]]] = [None] * bone_count
     bone_parents: list[int] = [-1] * bone_count
     children: dict[int, list[int]] = {}
@@ -100,7 +89,6 @@ def load_mesh_from_bdg(shape_path: Path):
         else:
             children.setdefault(rec['parent'], []).append(idx)
     if root_idx < 0:
-        # Fall back to any record with parent == -1 or 0.
         root_idx = 0
     queue = [root_idx]
     visited = set()
@@ -120,8 +108,6 @@ def load_mesh_from_bdg(shape_path: Path):
             bone_globals[idx] = bdg.mm(bone_globals[parent], local)
         for c in children.get(idx, ()):
             queue.append(c)
-    # Anything still unresolved (orphan records) -> drop the parent link so
-    # the overlay doesn't draw a bogus line back to bone 0.
     bone_positions: list[tuple[float, float, float]] = []
     for i, m in enumerate(bone_globals):
         if m is None:
@@ -133,25 +119,11 @@ def load_mesh_from_bdg(shape_path: Path):
     submeshes, _ = bdg.choose_meshes(D, bone_count)
 
     verts, norms, uvs, tris = [], [], [], []
-    # Per unique source vertex (v_start + idx * v_stride), remember the BDG
-    # byte offset of its position field so edit-mode can pack changes back.
-    # Layout-dependent because skin64/blend76/skin40 store position at offset 0
-    # but we still need to know the layout to know how many bytes to write.
     src_to_render: dict[tuple[int, int], list[int]] = {}
-    vertex_src: list[tuple[int, int, str]] = []  # per-render-vertex: (v_start, src_idx, layout)
-    tri_groups: list[int] = []  # per-triangle: index into submeshes
-    # The viewer only needs position/UV/normal. Skip the strict bdg.parse_*
-    # helpers because they raise on out-of-range bone ids, which some shipped
-    # BDGs contain (the GPU clamps them at runtime). Read the three fields
-    # we care about directly per layout so a bad bone slot can't bork the load.
+    vertex_src: list[tuple[int, int, str]] = []
+    tri_groups: list[int] = []
+
     def _read_pos_uv_nrm(off: int, layout: str):
-        # Field offsets must match utils/bdg_to_fbx_extract_all.parse_vertex_by_layout
-        # exactly. Anything that falls through to "else" silently reads UVs
-        # from the wrong byte range -- on blend52/blend60 streams that lands
-        # on the packed bone-id u16 pair, which when reinterpreted as floats
-        # produces huge magnitudes that the GL_REPEAT sampler smears across
-        # the entire atlas. JetJaguar, Biollante, Gigan, and SpaceGodzilla
-        # all carry blend52/blend60/skin48 submeshes.
         if layout == 'skin64':
             x, y, z = struct.unpack('>3f', D[off:off + 12])
             u, v = struct.unpack('>2f', D[off + 20:off + 28])
@@ -186,16 +158,11 @@ def load_mesh_from_bdg(shape_path: Path):
                 ids.append(vid)
                 verts.append(tuple(map(float, pos)))
                 norms.append(tuple(map(float, nrm)))
-                # _read_pos_uv_nrm already flipped V to FBX convention; flip
-                # back so it matches PIL's top-left origin for GL upload.
                 uvs.append((float(uv[0]), 1.0 - float(uv[1])))
                 vertex_src.append((sm['v_start'], idx, layout))
                 src_to_render.setdefault(src_key, []).append(vid)
             tris.append(tuple(ids))
             tri_groups.append(grp_idx)
-    # Per-bone record offsets and local translations so edit mode can both
-    # rebuild the overlay live (when a bone is dragged) and pack changes back
-    # into the BDG. `t` is local to the parent.
     bone_record_offsets = [0] * bone_count
     bone_local_translations = [(0.0, 0.0, 0.0)] * bone_count
     bone_local_quats = [(0.0, 0.0, 0.0, 1.0)] * bone_count
@@ -210,7 +177,6 @@ def load_mesh_from_bdg(shape_path: Path):
 
 
 def find_texture_pairs(shape_path: Path):
-    """Return {suffix: dict} for each _M/_B/_C/_S texture in the BDG."""
     parser = PipeworksParser(str(shape_path))
     files = parser.parse()
     by_num: dict[int, dict] = {}
@@ -269,16 +235,12 @@ def decode_texture_image(shape_path: Path, suffix: str) -> tuple[Image.Image | N
     if img is None:
         return None, f'unsupported format {pair["fmt"]} for _{suffix}'
     if suffix == 'B':
-        # _B bump maps are stored as RGB565 normal data; the raw RGB channels
-        # are noisy and red-shifted when shown directly. Force grayscale so
-        # the user sees a clean height/normal preview.
         lum = img.convert('L')
         img = Image.merge('RGBA', (lum, lum, lum, Image.new('L', lum.size, 255)))
     return img, f'_{suffix} {pair["fmt"]} {pair["w"]}x{pair["h"]}'
 
 
 def _build_mip_chain(img: Image.Image, fmt: str, original_size: int) -> bytes:
-    """Encode top image plus halving mipmaps until the buffer fills original_size."""
     out = bytearray()
     w, h = img.width, img.height
     cur = img
@@ -310,7 +272,6 @@ def _build_mip_chain(img: Image.Image, fmt: str, original_size: int) -> bytes:
 
 
 def _encode_rgb565_inline(img: Image.Image) -> bytes:
-    """Wii-tiled RGB565 (4x4 pixel tiles, big-endian)."""
     img = img.convert('RGB')
     w, h = img.size
     px = img.load()
@@ -327,8 +288,6 @@ def _encode_rgb565_inline(img: Image.Image) -> bytes:
 
 
 def _encode_rgb5a3_inline(img: Image.Image) -> bytes:
-    """Wii-tiled RGB5A3 (4x4 tiles, big-endian). Opaque pixels use the 5/5/5
-    branch (top bit set); translucent pixels use the 3/4/4/4 branch."""
     img = img.convert('RGBA')
     w, h = img.size
     px = img.load()
@@ -348,7 +307,6 @@ def _encode_rgb5a3_inline(img: Image.Image) -> bytes:
 
 
 def _encode_i8_inline(img: Image.Image) -> bytes:
-    """Wii-tiled I8 (8x4 pixel tiles)."""
     img = img.convert('L')
     w, h = img.size
     px = img.load()
@@ -363,8 +321,7 @@ def _encode_i8_inline(img: Image.Image) -> bytes:
 
 
 def _encode_cmpr_inline(img: Image.Image) -> bytes:
-    """Tiny CMPR encoder (DXT1 in GameCube macroblock order)."""
-    from fbx_to_bdg_import import dxt1_block_encode  # reuse proven encoder
+    from fbx_to_bdg_import import dxt1_block_encode
     img = img.convert('RGBA')
     w, h = img.size
     px = img.load()
@@ -385,7 +342,6 @@ def _encode_cmpr_inline(img: Image.Image) -> bytes:
 
 
 def _multiply(a: Image.Image, b: Image.Image) -> Image.Image:
-    """Per-channel multiply blend (RGB), preserving alpha from a."""
     from PIL import ImageChops
     ar, ag, ab, aa = a.convert('RGBA').split()
     br, bg, bb, _ = b.convert('RGBA').split()
@@ -414,12 +370,10 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
     DEFAULT_YAW = 210.0
     DEFAULT_PITCH = 12.0
     DEFAULT_ZOOM = 1.1
-    DEFAULT_PAN_X_FRAC = 0.0  # 0 = centered horizontally
-    # Mesh sits centered on the grid by default; the negative-X nudge that
-    # used to push the model off to one side has been removed.
+    DEFAULT_PAN_X_FRAC = 0.0
     DEFAULT_MODEL_PAN_X_FRAC = 0.0
     DEFAULT_MODEL_PAN_Z_FRAC = 0.0
-    SPIN_SPEEDS = (0.0, 0.45, 1.6)  # off, slow, fast (deg per frame @ ~60fps)
+    SPIN_SPEEDS = (0.0, 0.45, 1.6)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -434,66 +388,46 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self.zoom = self.DEFAULT_ZOOM
         self.pan_x = 0.0
         self.pan_y = 0.0
-        # Model rotation is stored as a 3x3 matrix (row-major) so that
-        # right-click drags can rotate around the camera's view-space axes
-        # rather than around fixed Euler angles. Identity to start.
-        # Viewer-only upright orientation: +90 deg about the world X axis.
-        # Applied at render time only; the BDG vertex/bone data on disk is
-        # never modified. Reset View (R) restores this same orientation.
+        # Upright orientation (+90 deg X). Render-only, never written to disk.
         self.model_rot = [
             1.0,  0.0, 0.0,
             0.0,  0.0, 1.0,
             0.0, -1.0, 0.0,
         ]
 
-        # Smooth interaction state.
         self._target_yaw = self.yaw
         self._target_pitch = self.pitch
         self._target_zoom = self.zoom
         self._target_pan_x = 0.0
         self._target_pan_y = 0.0
         self._default_pan_x = 0.0
-        # F-key state: 'frame' = next press centers/zooms, 'reset' = next press
-        # resets the full view. Camera input arms it back to 'frame'.
         self._frame_action_next = 'frame'
-        # Mesh-only translation applied after model_rot (so G/grab moves the
-        # rendered mesh, not the grid/axes). Render-only; never written back.
         self.model_pan_x = 0.0
         self.model_pan_y = 0.0
         self.model_pan_z = 0.0
         self._yaw_velocity = 0.0
         self._pitch_velocity = 0.0
-        self._spin_stage = 0  # 0=off, 1=slow, 2=fast
+        self._spin_stage = 0
 
         self.bone_positions: list[tuple[float, float, float]] = []
         self.bone_parents: list[int] = []
-        # Wireframe modes: 0 = off, 1 = black wires, 2 = colored wires.
         self.wire_mode = 1
-        self.show_wireframe = True  # legacy alias kept in sync with wire_mode != 0
+        self.show_wireframe = True
         self.show_bones = False
         self.show_uv_overlay = False
         self._uv_tex_id = 0
         self.clear_color = (0.10, 0.11, 0.13)
-        # Spotlight state. light_index 0 = neutral white fill (no tint);
-        # higher indices switch to a colored spot from the camera.
         self.light_index = 0
 
-        # Edit-mode state. Touch-up vertex editor: marquee-select verts, then
-        # `G` to grab/translate them in screen space. Confirm with Enter or
-        # mouse-click; cancel with Esc.
         self.edit_mode = False
-        self.edit_target = 'vertex'  # 'vertex' or 'bone'
+        self.edit_target = 'vertex'
         self.selected_verts: set[int] = set()
         self.selected_bones: set[int] = set()
         self.vertex_src: list[tuple[int, int, str]] = []
         self.src_to_render: dict[tuple[int, int], list[int]] = {}
-        # Bone edit metadata. Local translations are stored relative to the
-        # parent; we recompute world positions whenever a local changes.
         self.bone_record_offsets: list[int] = []
         self.bone_locals: list[tuple[float, float, float]] = []
         self.bone_quats: list[tuple[float, float, float, float]] = []
-        # Lock state and pristine baseline. Locked bones reject all edits; the
-        # baseline lets the user reset a bone to its original local transform.
         self.bone_locked: set[int] = set()
         self.bone_locals_baseline: list[tuple[float, float, float]] = []
         self._bone_grab_origin_locals: dict[int, tuple[float, float, float]] = {}
@@ -503,45 +437,25 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self._grab_active = False
         self._grab_start: QPoint | None = None
         self._grab_origin_positions: dict[int, tuple[float, float, float]] = {}
-        # Rotate-mode state. Reuses _grab_start as the anchor pixel, but
-        # captures the original world positions and the rotation pivot.
         self._rotate_active = False
         self._rotate_pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._rotate_origin_positions: dict[int, tuple[float, float, float]] = {}
         self._rotate_origin_bone_locals: dict[int, tuple[float, float, float]] = {}
-        # Hover state for individual vertex/bone highlighting.
         self._hover_vert: int | None = None
         self._hover_bone: int | None = None
-        # Rotate axis constraint: 'view' (default), 'x', 'y', or 'z'. Set by
-        # pressing X/Y/Z while a rotation is in progress, or before starting.
         self._rotate_axis_mode: str = 'view'
-        # True while the user is dragging one of the gizmo rings with LMB.
         self._gizmo_drag_active = False
-        # Which gizmo ring is currently hovered ('x'|'y'|'z'|None).
         self._hover_ring: str | None = None
-        # Which gizmo arrow is currently hovered ('x'|'y'|'z'|None).
         self._hover_arrow: str | None = None
-        # 'rotate' shows the X/Y/Z rings, 'translate' shows X/Y/Z arrows.
-        # None hides the gizmo until R or G is pressed.
         self._gizmo_mode: str | None = None
-        # True while the user is dragging a translate arrow with LMB.
         self._gizmo_translate_active = False
         self._gizmo_translate_axis: str | None = None
-        # Translate axis constraint while in active grab ('x'|'y'|'z'|None).
-        # Toggled by pressing X/Y/Z during G grab (Blender-style).
         self._grab_axis_mode: str | None = None
-        # Overlay visibility cycle, advanced by the H hotkey:
-        #   0 = grid + axes (default)
-        #   1 = grid only (axes hidden)
-        #   2 = nothing
         self.overlay_mode = 0
         self.show_grid = True
-        # View-mode gizmo (outside edit mode). R shows rotate rings on the
-        # whole mesh, G shows translate arrows. Dragging a handle drives
-        # model_rot / model_pan_* respectively.
         self._view_gizmo_mode: str | None = None
-        self._view_gizmo_drag_active = False         # rotating rings
-        self._view_gizmo_translate_active = False    # dragging arrows
+        self._view_gizmo_drag_active = False
+        self._view_gizmo_translate_active = False
         self._view_gizmo_axis: str | None = None
         self._view_drag_start: QPoint | None = None
         self._view_drag_origin_pan = (0.0, 0.0, 0.0)
@@ -559,19 +473,14 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self._mesh_dirty = False
         self.setMinimumSize(640, 480)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        # Enable hover tracking so edit-mode highlights respond without a
-        # mouse button being held.
         self.setMouseTracking(True)
 
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(16)  # ~60 fps
+        self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._tick)
         self._anim_timer.start()
 
     def set_mesh(self, vertices, normals, uvs, triangles):
-        # Clear any in-flight transform/selection state so leftovers from a
-        # previously loaded model can't index into the new (different-sized)
-        # vertex / bone arrays.
         if hasattr(self, '_cancel_grab'):
             try:
                 self._cancel_grab()
@@ -608,9 +517,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             xs = [v[0] for v in vertices]
             ys = [v[1] for v in vertices]
             zs = [v[2] for v in vertices]
-            # Use bounding-box center so the camera orbits around the actual
-            # geometric middle of the model rather than a vertex-density-biased
-            # centroid (which can leave the mesh visibly off-frame).
             cx = (min(xs) + max(xs)) * 0.5
             cy = (min(ys) + max(ys)) * 0.5
             cz = (min(zs) + max(zs)) * 0.5
@@ -619,8 +525,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 math.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2)
                 for x, y, z in vertices
             ) or 1.0
-            # Recompute default pan now that we know the model size, then
-            # re-center the view so freshly loaded models appear framed.
             self._default_pan_x = self.radius * self.DEFAULT_PAN_X_FRAC
             self._target_pan_x = self._default_pan_x
             self._target_pan_y = 0.0
@@ -628,9 +532,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self.model_pan_x = self.radius * self.DEFAULT_MODEL_PAN_X_FRAC
             self.model_pan_y = 0.0
             self.model_pan_z = self.radius * self.DEFAULT_MODEL_PAN_Z_FRAC
-            # Restore the upright orientation each load so a previously
-            # rotated mesh (from R-gizmo dragging) doesn't carry over and
-            # leave the new model on its side / behind the camera.
             self.model_rot = [
                 1.0,  0.0, 0.0,
                 0.0,  0.0, 1.0,
@@ -666,9 +567,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self.update()
 
     def _ensure_uv_overlay_texture(self):
-        """Build a Blender-style UV checker texture lazily. The pattern uses red
-        for the U axis and green for the V axis, with darker/lighter cells so
-        seams and stretching are obvious on the model."""
         if self._uv_tex_id:
             return self._uv_tex_id
         size = 256
@@ -679,21 +577,16 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             for x in range(size):
                 cx = x // cell
                 cy = y // cell
-                # Base checker tone: alternate light/dark grey
                 light = ((cx + cy) & 1) == 0
                 base = 220 if light else 150
                 r = base
                 g = base
                 b = base
-                # Tint columns red and rows green so users can read U vs V.
-                # Horizontal gradient across U (left=dark red, right=bright red),
-                # vertical gradient across V (bottom=dark green, top=bright).
                 u_t = x / (size - 1)
                 v_t = y / (size - 1)
                 r = int(r * 0.6 + 255 * 0.4 * u_t)
                 g = int(g * 0.6 + 255 * 0.4 * v_t)
                 b = int(b * 0.7)
-                # Black grid lines on cell boundaries for sharp readability.
                 on_grid = (x % cell == 0) or (y % cell == 0)
                 if on_grid:
                     r = g = b = 20
@@ -734,10 +627,8 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         return self.set_light_index(self.light_index + 1)
 
     def _apply_lighting_state(self):
-        """Configure GL_LIGHT0 each frame so the spotlight tracks the camera."""
         name, (r, g, b), is_spot = self.LIGHT_PRESETS[self.light_index]
         if not is_spot:
-            # Plain directional fill — original behavior.
             GL.glLightfv(GL.GL_LIGHT0, GL.GL_POSITION, (0.5, 1.0, 0.8, 0.0))
             GL.glLightfv(GL.GL_LIGHT0, GL.GL_DIFFUSE, (r, g, b, 1.0))
             GL.glLightfv(GL.GL_LIGHT0, GL.GL_AMBIENT, (0.25, 0.25, 0.28, 1.0))
@@ -747,17 +638,12 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glLightf(GL.GL_LIGHT0, GL.GL_LINEAR_ATTENUATION, 0.0)
             GL.glLightf(GL.GL_LIGHT0, GL.GL_QUADRATIC_ATTENUATION, 0.0)
             return
-        # Colored spotlight cast from the camera, cone widened so the model
-        # still reads as well-lit. We keep the neutral white fill component
-        # too via stronger ambient + emission-style boost so the colored
-        # spot doesn't look dim compared to the default.
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_POSITION, (0.0, 0.0, 0.0, 1.0))
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_SPOT_DIRECTION, (0.0, 0.0, -1.0))
         GL.glLightf(GL.GL_LIGHT0, GL.GL_SPOT_CUTOFF, 35.0)
         GL.glLightf(GL.GL_LIGHT0, GL.GL_SPOT_EXPONENT, 6.0)
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_DIFFUSE, (r * 1.4, g * 1.4, b * 1.4, 1.0))
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_SPECULAR, (r, g, b, 1.0))
-        # Bright tinted ambient so off-cone areas keep the hue but stay visible.
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_AMBIENT,
                      (0.20 * r + 0.10, 0.20 * g + 0.10, 0.20 * b + 0.10, 1.0))
         GL.glLightf(GL.GL_LIGHT0, GL.GL_CONSTANT_ATTENUATION, 1.0)
@@ -793,10 +679,8 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_DIFFUSE, (1.0, 1.0, 1.0, 1.0))
         GL.glLightfv(GL.GL_LIGHT0, GL.GL_AMBIENT, (0.25, 0.25, 0.28, 1.0))
         GL.glShadeModel(GL.GL_SMOOTH)
-        # Alpha blending so textures with transparency render correctly.
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-        # Discard fully-transparent fragments to avoid depth issues on cutouts.
         GL.glEnable(GL.GL_ALPHA_TEST)
         GL.glAlphaFunc(GL.GL_GREATER, 0.02)
 
@@ -849,28 +733,17 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glEndList()
 
     def _draw_grid_and_axes(self):
-        """Blender-style ground grid plus colored X/Y/Z axis lines.
-        Drawn in world space (after the modelview is set up), at the
-        model center elevation y = 0 in model space."""
         GL.glDisable(GL.GL_LIGHTING)
         GL.glDisable(GL.GL_TEXTURE_2D)
-        # Grid extends to roughly ten times the model radius so it scales
-        # naturally with whatever's loaded.
         extent = max(self.radius * 4.0, 4.0)
         step = max(self.radius * 0.25, 0.25)
-        # Snap step to a "round" number so cells line up across zooms.
         order = 10 ** math.floor(math.log10(step)) if step > 0 else 1.0
         step = order * (1 if step / order < 2 else (2 if step / order < 5 else 5))
         n = int(extent / step) + 1
-
-        # Drop the grid plane below the model so it sits like a floor.
         gy = -self.radius * 1.1
 
         GL.glLineWidth(1.0)
         GL.glBegin(GL.GL_LINES)
-        # Subtle minor grid lines on the XZ plane. When the colored axes are
-        # hidden we still draw the center row/column so the grid keeps its
-        # midline rather than showing a gap down the middle.
         GL.glColor3f(0.28, 0.30, 0.34)
         skip_center = self.overlay_mode == 0
         for i in range(-n, n + 1):
@@ -881,17 +754,13 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glVertex3f(-extent, gy, x); GL.glVertex3f(extent, gy, x)
         GL.glEnd()
 
-        # Bold colored axis lines (suppressed when overlay_mode hides axes).
         if self.overlay_mode == 0:
             GL.glLineWidth(1.6)
             GL.glBegin(GL.GL_LINES)
-            # X axis (red).
             GL.glColor3f(0.85, 0.25, 0.30)
             GL.glVertex3f(-extent, gy, 0.0); GL.glVertex3f(extent, gy, 0.0)
-            # Z axis (blue).
             GL.glColor3f(0.25, 0.50, 0.90)
             GL.glVertex3f(0.0, gy, -extent); GL.glVertex3f(0.0, gy, extent)
-            # Y axis (green) - vertical.
             GL.glColor3f(0.40, 0.80, 0.30)
             GL.glVertex3f(0.0, gy, 0.0); GL.glVertex3f(0.0, gy + extent, 0.0)
             GL.glEnd()
@@ -923,39 +792,23 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
 
         GL.glMatrixMode(GL.GL_MODELVIEW)
         GL.glLoadIdentity()
-        # Configure light in eye space so spotlights stay locked to the camera.
         self._apply_lighting_state()
         dist = self.radius * 2.5 * self.zoom
         GL.glTranslatef(self.pan_x, self.pan_y, -dist)
         GL.glRotatef(self.pitch, 1.0, 0.0, 0.0)
         GL.glRotatef(self.yaw, 0.0, 1.0, 0.0)
-        # Draw the world-space grid/axes here so they stay aligned to the
-        # world (not the model). The model itself gets a separate transform
-        # below that applies model_rot plus a viewer-only +90 deg about Z so
-        # the BDG mesh stands upright facing the camera, without modifying
-        # any saved vertex data.
         if self.show_grid and self.overlay_mode != 2:
             cx_w, cy_w, cz_w = self.center
             GL.glPushMatrix()
             GL.glTranslatef(-cx_w, -cy_w, -cz_w)
             self._draw_grid_and_axes()
             GL.glPopMatrix()
-            # _draw_grid_and_axes disables lighting for its line work and
-            # never restores it; the mesh after this would otherwise render
-            # flat-shaded, matching the "grid off looks better" symptom.
             GL.glEnable(GL.GL_LIGHTING)
-        # Cache the world-space MV (camera only, before model_rot/center) so
-        # the view-mode rotate/translate gizmos can project against world axes.
         try:
             self._cached_world_mv = list(GL.glGetFloatv(GL.GL_MODELVIEW_MATRIX).flatten())
         except Exception:
             self._cached_world_mv = None
-        # Mesh-only translation (G grab) — moves the rendered mesh in world
-        # space without touching the grid/axes. Render-only; never saved.
         GL.glTranslatef(self.model_pan_x, self.model_pan_y, self.model_pan_z)
-        # Right-click model rotation: applied as a free-form 3x3 matrix so
-        # that drags rotate around the camera's view-space axes (see
-        # mouseMoveEvent). Pivots about the model center.
         m = self.model_rot
         gl_mat = [
             m[0], m[3], m[6], 0.0,
@@ -967,7 +820,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         cx, cy, cz = self.center
         GL.glTranslatef(-cx, -cy, -cz)
 
-        # Cache modelview/projection/viewport for edit-mode picking.
         try:
             self._cached_view_matrix = list(GL.glGetFloatv(GL.GL_MODELVIEW_MATRIX).flatten())
             self._cached_proj_matrix = list(GL.glGetFloatv(GL.GL_PROJECTION_MATRIX).flatten())
@@ -1008,18 +860,14 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glEnable(GL.GL_POLYGON_OFFSET_LINE)
             GL.glPolygonOffset(-1.0, -1.0)
             if self.wire_mode == 2:
-                # Colored: bright wire so it stays visible regardless of fill.
                 GL.glColor4f(0.05, 0.95, 0.55, 0.9)
             else:
-                # Black: stays black even when textures are on.
                 GL.glColor4f(0.02, 0.03, 0.04, 0.95)
             GL.glCallList(self._mesh_list)
             GL.glDisable(GL.GL_POLYGON_OFFSET_LINE)
             GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
             GL.glEnable(GL.GL_LIGHTING)
 
-        # Hide the always-on bones overlay while editing verts; bone target
-        # gets its own draw further down.
         bones_visible = self.show_bones and self.bone_positions and not (
             self.edit_mode and self.edit_target == 'vertex'
         )
@@ -1048,11 +896,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glEnable(GL.GL_LIGHTING)
 
         if self.edit_mode:
-            # Sample the depth buffer now (after the mesh has rasterized but
-            # before we draw any overlay points). This is what we use to cull
-            # vertices that are occluded by closer geometry, the same trick
-            # Blender's "limit selection to visible" relies on. Cached for
-            # this frame so picking/marquee see the same data the user does.
             self._depth_buffer = self._read_depth_snapshot(w, h)
             GL.glDisable(GL.GL_LIGHTING)
             GL.glDisable(GL.GL_TEXTURE_2D)
@@ -1126,7 +969,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     p = self.bone_positions[self._hover_bone]
                     GL.glVertex3f(p[0], p[1], p[2])
                     GL.glEnd()
-                # Draw the bone hierarchy lines so the user can see structure.
                 GL.glLineWidth(1.5)
                 GL.glColor3f(0.7, 0.6, 0.2)
                 GL.glBegin(GL.GL_LINES)
@@ -1144,13 +986,10 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glEnable(GL.GL_LIGHTING)
             self._draw_marquee_overlay(w, h)
         else:
-            # Outside edit mode: R/G show whole-mesh rotate / translate gizmos.
             if self._view_gizmo_mode in ('rotate', 'translate'):
                 GL.glDisable(GL.GL_LIGHTING)
                 GL.glDisable(GL.GL_DEPTH_TEST)
                 GL.glDisable(GL.GL_TEXTURE_2D)
-                # Restore the camera-only modelview so the gizmo lives in
-                # world space (independent of the mesh's R/right-drag rotation).
                 if getattr(self, '_cached_world_mv', None):
                     GL.glPushMatrix()
                     GL.glLoadMatrixf(self._cached_world_mv)
@@ -1228,7 +1067,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glVertex3f(px, py, pz)
             GL.glVertex3f(px + dx, py + dy, pz + dz)
             GL.glEnd()
-            # Tip marker so the arrow reads as a handle.
             GL.glPointSize(10.0 if (active == axis_name or hovered == axis_name) else 8.0)
             GL.glBegin(GL.GL_POINTS)
             GL.glVertex3f(px + dx, py + dy, pz + dz)
@@ -1237,9 +1075,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glPointSize(1.0)
 
     def _read_depth_snapshot(self, w: int, h: int):
-        """Read the current depth buffer back so edit-mode can do occlusion
-        culling against the actual rasterized scene. Returns (floats, w, h)
-        or None on failure."""
         if w <= 0 or h <= 0:
             return None
         pw, ph = w, h
@@ -1249,7 +1084,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             return None
         if raw is None:
             return None
-        # PyOpenGL hands back either a numpy array or a bytes-like object.
         try:
             buf = raw.reshape(-1)
         except AttributeError:
@@ -1340,7 +1174,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._marquee_end = p
             self.update()
             return
-        # Stop auto-spin when user grabs to rotate.
         if e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton) and self._spin_stage:
             self._spin_stage = 0
             self._yaw_velocity = 0.0
@@ -1359,10 +1192,8 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self.update()
             return
         if self.edit_mode and e.button() == Qt.MouseButton.LeftButton and self._gizmo_drag_active:
-            # Release on a gizmo ring confirms the rotation.
             self._gizmo_drag_active = False
             self._confirm_grab()
-            # Keep the gizmo on screen so the user can chain more rotations.
             self._gizmo_mode = 'rotate'
             self.update()
             return
@@ -1383,7 +1214,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             click_select = getattr(self, '_click_select', None)
             if drag_pix <= 4 and click_select is not None:
-                # Treat as a click, not a marquee. Ctrl toggles, Shift adds.
                 click_select(float(end.x()), float(end.y()), ctrl, shift)
             else:
                 additive = ctrl or shift
@@ -1464,16 +1294,10 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._target_pitch = max(-89.0, min(89.0, self._target_pitch + dy * 0.5))
             self._arm_frame_next()
         elif buttons & Qt.MouseButton.RightButton:
-            # Right-drag rotates the model around the camera's view-space
-            # axes (horizontal drag spins around the camera's up axis,
-            # vertical drag tilts around the camera's right axis), so the
-            # rotation always feels relative to what you're looking at —
-            # not a fixed world-Y / world-X Euler.
             yaw_rad = math.radians(self.yaw)
             pitch_rad = math.radians(self.pitch)
             cy_, sy_ = math.cos(yaw_rad), math.sin(yaw_rad)
             cp_, sp_ = math.cos(pitch_rad), math.sin(pitch_rad)
-            # World-space directions of the camera's right and up axes.
             right_axis = (cy_, 0.0, sy_)
             up_axis = (sy_ * sp_, cp_, -cy_ * sp_)
             self._apply_model_rotation(up_axis, dx * 0.5)
@@ -1550,11 +1374,9 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glPointSize(1.0)
 
     def _mesh_world_center(self) -> tuple[float, float, float]:
-        """World-space position to anchor the view-mode gizmo at (mesh pan)."""
         return (self.model_pan_x, self.model_pan_y, self.model_pan_z)
 
     def _project_world(self, p):
-        """Project a WORLD-space point (using camera-only MV) to pixels."""
         mv = getattr(self, '_cached_world_mv', None)
         pr = self._cached_proj_matrix
         vp = self._cached_viewport
@@ -1649,8 +1471,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             return
         dx_pix = current.x() - self._view_drag_start.x()
         dy_pix = current.y() - self._view_drag_start.y()
-        # Convert pixel delta to world distance at the model's depth, in the
-        # camera's view-aligned right/up vectors.
         h = max(1, self.height())
         dist = self.radius * 2.5 * self.zoom
         fov = math.radians(45.0)
@@ -1669,7 +1489,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         ax = self._view_gizmo_axis
         if ax == 'x':
             wy = wz = 0.0
-            # Project drag onto world X by taking the X component only.
         elif ax == 'y':
             wx = wz = 0.0
         elif ax == 'z':
@@ -1690,7 +1509,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             return
         dx = current.x() - self._view_drag_start.x()
         dy = current.y() - self._view_drag_start.y()
-        # Use combined drag magnitude as the rotation amount; sign from dx.
         angle = (dx + dy) * 0.5
         ax = self._view_gizmo_axis
         if ax == 'x':
@@ -1760,15 +1578,12 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     self.set_rotate_axis_mode(axis)
                     return
                 if self._grab_active:
-                    # Toggle off if pressing the same axis a second time.
                     self._grab_axis_mode = None if self._grab_axis_mode == axis else axis
                     from PyQt6.QtGui import QCursor
                     cur = self.mapFromGlobal(QCursor.pos())
                     self._apply_grab(cur)
                     self.update()
                     return
-                # Outside of an active transform, X/Y/Z primes the axis so the
-                # next R press starts constrained.
                 self._rotate_axis_mode = axis
                 self.update()
                 return
@@ -1780,8 +1595,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 self.set_edit_target('bone' if self.edit_target == 'vertex' else 'vertex')
                 return
             if key == Qt.Key.Key_L and self.edit_target == 'vertex':
-                # Blender-style Select Linked. Hover seeds the flood; with no
-                # hover, grow whatever is already selected.
                 seed = self._hover_vert
                 if seed is None and not self.selected_verts:
                     return
@@ -1802,15 +1615,11 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     self.update()
                 return
         if key == Qt.Key.Key_E:
-            # Bubble up to the main window so the menu checkbox stays in sync.
             super().keyPressEvent(e)
             return
         if self.edit_mode:
-            # Swallow remaining viewer hotkeys (R/F/O) while editing so they
-            # don't fire alongside editor commands.
             return
         if key == Qt.Key.Key_R:
-            # Toggle the view-mode rotate gizmo (axis rings around the mesh).
             self._view_gizmo_mode = None if self._view_gizmo_mode == 'rotate' else 'rotate'
             self._view_hover_ring = None
             self._view_hover_arrow = None
@@ -1820,7 +1629,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         elif key == Qt.Key.Key_O:
             self.cycle_spin()
         elif key == Qt.Key.Key_G:
-            # Toggle the view-mode translate gizmo (axis arrows on the mesh).
             self._view_gizmo_mode = None if self._view_gizmo_mode == 'translate' else 'translate'
             self._view_hover_ring = None
             self._view_hover_arrow = None
@@ -1850,7 +1658,6 @@ _UV_GROUP_COLORS = [
 
 
 class UVMapView(QWidget):
-    """Paints the texture (optional) with UV islands overlaid, colored per group."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1882,10 +1689,6 @@ class UVMapView(QWidget):
         self._uvs = list(uvs)
         self._tris = list(tris)
         self._groups = list(groups) if groups else [0] * len(tris)
-        # Compute UV bounds (joined with the [0,1] texture box) so the initial
-        # view fits both. Many BDGs store UVs that wrap or sit outside [0,1].
-        # Always frame the [0,1] texture box; clipped UVs aren't drawn so
-        # there's no need to expand the view for them.
         self._uv_bounds = (0.0, 0.0, 1.0, 1.0)
         self.reset_view()
 
@@ -1929,16 +1732,12 @@ class UVMapView(QWidget):
             self.update()
 
     def _texture_rect(self):
-        """Pixel rect for the [0,1]x[0,1] texture square at current zoom/pan."""
         umin, vmin, umax, vmax = self._uv_bounds
         span = max(umax - umin, vmax - vmin, 1e-6)
         avail = max(64, min(self.width(), self.height()) - 24)
-        # At zoom=1, fit the joined UV+texture bounds into the widget.
         side = (avail / span) * self._zoom
         cx = self.width() / 2 + self._pan.x()
         cy = self.height() / 2 + self._pan.y()
-        # Texture covers [0,1] within the bounds; offset so the bounds box
-        # is centered at (cx, cy).
         bw = (umax - umin) * side
         bh = (vmax - vmin) * side
         ox = cx - bw / 2 - umin * side
@@ -1951,7 +1750,6 @@ class UVMapView(QWidget):
         p.fillRect(self.rect(), QColor(24, 26, 30))
         ox, oy, side = self._texture_rect()
         ox_i, oy_i, side_i = int(ox), int(oy), max(1, int(side))
-        # Texture or checkerboard background covers the [0,1] texture region.
         if self._show_texture and self._tex_pixmap is not None:
             p.drawPixmap(ox_i, oy_i, side_i, side_i, self._tex_pixmap)
         else:
@@ -1964,7 +1762,6 @@ class UVMapView(QWidget):
                 fy = oy_i + side_i * i // 8
                 p.drawLine(fx, oy_i, fx, oy_i + side_i)
                 p.drawLine(ox_i, fy, ox_i + side_i, fy)
-        # Frame.
         p.setPen(QPen(QColor(100, 105, 115), 1))
         p.drawRect(ox_i, oy_i, side_i, side_i)
 
@@ -1975,12 +1772,7 @@ class UVMapView(QWidget):
         def to_screen(uv):
             u, v = uv
             return (ox + u * side, oy + v * side)
-        # `side` is the pixel size of the [0,1] texture box, so UV (0..1)
-        # maps onto the texture, and out-of-range UVs land outside it.
 
-        # Edges per triangle, colored by group. Only draw triangles whose UVs
-        # all sit inside the texture box; out-of-range islands are dropped so
-        # they don't smear off-screen.
         eps = 1e-4
         for ti, (a, b, c) in enumerate(self._tris):
             if a >= len(self._uvs) or b >= len(self._uvs) or c >= len(self._uvs):
@@ -2055,10 +1847,10 @@ class MainWindow(QMainWindow):
         self.root = root
         self.shape_path: Path | None = None
         self.active_texture_suffix: str | None = None
-        self._preview_mode = False  # True when Game Preview composite is active
+        self._preview_mode = False
         self._tri_groups: list[int] = []
         self._uv_dialog: 'UVMapDialog | None' = None
-        self.crit_mass_action = None  # set when top bar is built
+        self.crit_mass_action = None
 
         self.setWindowTitle('[GZME] GodZilla Model Editor')
         self.resize(1024, 720)
@@ -2075,7 +1867,6 @@ class MainWindow(QMainWindow):
         self.controls_overlay.show()
         self._controls_visible = True
 
-        # Texture preview thumbnail (lives below the controls overlay).
         self.texture_preview = QLabel(self.viewer)
         self.texture_preview.setFixedSize(180, 180)
         self.texture_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2084,8 +1875,6 @@ class MainWindow(QMainWindow):
 
         self.viewer.installEventFilter(self)
 
-        # Blender-style overlay toggle: Alt+Shift+Z cycles
-        # grid + axes -> grid only -> nothing.
         self._overlay_shortcut = QShortcut(QKeySequence('Z'), self)
         self._overlay_shortcut.activated.connect(self._cycle_overlay_mode)
 
@@ -2101,7 +1890,6 @@ class MainWindow(QMainWindow):
         wrap.setLayout(layout)
         self.setCentralWidget(wrap)
         self.setStatusBar(QStatusBar())
-        # Persistent geometry info shown on the right of the status bar.
         self.geom_label = QLabel('No model loaded')
         self.statusBar().addPermanentWidget(self.geom_label)
 
@@ -2114,8 +1902,6 @@ class MainWindow(QMainWindow):
 
         self.apply_theme(self._theme_key)
 
-        # Restore saved folder + selected model. If they're missing we silently
-        # fall back to the launch directory so a deleted folder never crashes.
         saved_folder = self._config.get('folder')
         if saved_folder and Path(saved_folder).is_dir():
             self.root = Path(saved_folder)
@@ -2205,9 +1991,6 @@ class MainWindow(QMainWindow):
     def apply_theme(self, key: str):
         self._theme_key = key
         theme = get_theme(key)
-        # Build per-theme combobox + popup styling. Qt's combo dropdown is a
-        # separate top-level widget; the safest reliable styling is via app
-        # stylesheet selectors targeting QComboBox QAbstractItemView.
         text = theme['text_color']
         muted = theme['muted_color']
         r, g, b = theme['viewer_clear']
@@ -2216,8 +1999,6 @@ class MainWindow(QMainWindow):
             bg, hover_bg, sel_bg = '#23272e', '#343b45', '#3f4753'
         else:
             bg, hover_bg, sel_bg = '#ffffff', '#e6ecf5', '#cfdcef'
-        # Solid-color overrides for themes whose viewer color doesn't match
-        # the chrome (e.g. Win98 uses a teal viewport but grey UI).
         chrome_overrides = {
             'win98':  ('#ffffff', '#000080', '#000080'),
             'hotdog': ('#ffff00', '#ff0000', '#ff0000'),
@@ -2237,8 +2018,6 @@ class MainWindow(QMainWindow):
             f'QComboBox QAbstractItemView::item{{padding:4px 8px;min-height:18px;}}'
         )
         self.setStyleSheet(theme['app_qss'] + combo_qss)
-        # Re-apply directly to the popup view too, since Qt sometimes builds
-        # it before the global stylesheet propagates.
         if hasattr(self, 'model_combo'):
             self.model_combo.view().setStyleSheet(combo_qss)
         self.path_label.setStyleSheet(theme['path_label_qss'])
@@ -2248,7 +2027,6 @@ class MainWindow(QMainWindow):
         self.texture_preview.setStyleSheet(theme['preview_qss'])
         self.viewer.set_clear_color(theme['viewer_clear'])
         self._reposition_overlays()
-        # Persist preference.
         cfg = load_config()
         cfg['theme'] = key
         save_config(cfg)
@@ -2371,7 +2149,6 @@ class MainWindow(QMainWindow):
         return wrap
 
     def _reposition_overlays(self):
-        # Place texture preview just below the controls help panel.
         self.controls_overlay.move(12, 12)
         self.controls_overlay.adjustSize()
         y = 12 + self.controls_overlay.height() + 10
@@ -2396,9 +2173,6 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.KeyPress:
                 if self._handle_viewer_key(event):
                     return True
-                # While editing, the V/B sub-mode keys are handled inside the
-                # viewer; refresh the help panel so the active target indicator
-                # stays in sync.
                 if self.viewer.edit_mode and event.key() in (Qt.Key.Key_V, Qt.Key.Key_B):
                     QTimer.singleShot(0, self._refresh_controls_panel)
             if event.type() == QEvent.Type.Resize:
@@ -2406,10 +2180,6 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _handle_viewer_key(self, event) -> bool:
-        # In edit mode, the viewer's per-key shortcuts (G grab, T texture, etc.)
-        # would collide with editor commands. Suppress all of them; the
-        # MeshViewer.keyPressEvent edit-mode branch handles editing keys, and
-        # `E` is intercepted by MainWindow.keyPressEvent to toggle the mode.
         if self.viewer.edit_mode:
             return False
         key = event.key()
@@ -2442,9 +2212,6 @@ class MainWindow(QMainWindow):
         if not self.shape_path:
             return
         cur = self.active_texture_suffix
-        # Build the cycle steps: each texture suffix, then "off" (None).
-        # Walk forward from the current step, skipping variants whose decode
-        # fails so a missing texture file can't dead-end the cycle.
         steps: list[str | None] = list(self._TEXTURE_CYCLE) + [None]
         if self._preview_mode or cur is None or cur not in self._TEXTURE_CYCLE:
             start = -1 if self._preview_mode or cur is None else len(steps) - 1
@@ -2460,7 +2227,6 @@ class MainWindow(QMainWindow):
                 return
 
     def _try_show_texture(self, suffix: str) -> bool:
-        """Like show_texture but returns True only if it actually applied."""
         if not self.shape_path:
             return False
         try:
@@ -2520,7 +2286,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('No *_Shapes.BDG files found in that folder', 6000)
 
     def _scan_folder(self, folder: Path):
-        """Recursively find *_Shapes.BDG files; populate the dropdown."""
         found: list[Path] = []
         try:
             for p in folder.rglob('*'):
@@ -2552,7 +2317,6 @@ class MainWindow(QMainWindow):
         self.shape_path = path
         self.watcher.addPath(str(path))
         self._update_path_label()
-        # Sync dropdown selection without re-triggering load.
         if hasattr(self, 'model_combo'):
             for i in range(self.model_combo.count()):
                 if self.model_combo.itemData(i) == str(path):
@@ -2561,7 +2325,6 @@ class MainWindow(QMainWindow):
                     self.model_combo.blockSignals(False)
                     break
         if not self.reload_model():
-            # Bail before applying any texture on top of the (now stale) mesh.
             return
 
     def _update_path_label(self):
@@ -2585,7 +2348,6 @@ class MainWindow(QMainWindow):
                 'Edit mode ON — V verts / B bones, drag-select, click +Shift add / +Ctrl toggle, L select linked, G grab, R rotate, A all, Enter confirm, Esc cancel',
                 0,
             )
-            # Make sure bones overlay is visible while bone-editing makes sense.
             self.viewer.show_bones = True
         else:
             self.viewer.show_bones = False
@@ -2605,7 +2367,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('Nothing to save.', 4000)
             return
         try:
-            # First-time backup: keep the original BDG so users can revert.
             backup = self.shape_path.with_suffix(self.shape_path.suffix + '.bak')
             if not backup.exists():
                 shutil.copy2(self.shape_path, backup)
@@ -2613,11 +2374,7 @@ class MainWindow(QMainWindow):
             for v_start, src_idx, layout, pos in vert_edits:
                 stride = {'skin64': 64, 'blend76': 76, 'blend52': 52, 'blend60': 60, 'skin48': 48, 'skin40': 40}.get(layout, 40)
                 off = v_start + src_idx * stride
-                # All three layouts store position in the first 12 bytes
-                # (skin64/skin40 keep an extra 4-byte 'w' at +12 we must not touch).
                 struct.pack_into('>3f', data, off, float(pos[0]), float(pos[1]), float(pos[2]))
-            # Bone records carry local translation as 3 floats at +32 (after
-            # idx/parent/nchild/name_idx + quaternion). See utils.skel_rec.
             for rec_off, t in bone_edits:
                 if rec_off <= 0 or rec_off + 44 > len(data):
                     continue
@@ -2633,8 +2390,6 @@ class MainWindow(QMainWindow):
         )
 
     def _build_stiff_bone_remap(self) -> dict[int, int]:
-        """For each locked bone, walk up parents to the first non-locked ancestor.
-        Returns {locked_bone_id: target_bone_id}."""
         locked = getattr(self.viewer, 'bone_locked', set())
         if not locked:
             return {}
@@ -2656,8 +2411,6 @@ class MainWindow(QMainWindow):
         return remap
 
     def _apply_stiff_bone_remap(self, data: bytearray, remap: dict[int, int]) -> int:
-        """Rewrite skin record bone-index fields so locked bones inherit their
-        first non-locked ancestor. Returns the number of slots changed."""
         if not remap:
             return 0
         changed = 0
@@ -2671,7 +2424,6 @@ class MainWindow(QMainWindow):
             stride = 64 if layout == 'skin64' else (76 if layout == 'blend76' else 40)
             off = v_start + src_idx * stride
             if layout in ('skin64', 'skin40', 'skin48'):
-                # Two u16 bone ids at +16 and +18.
                 if off + 20 > len(data):
                     continue
                 b0, b1 = struct.unpack_from('>2H', data, off + 16)
@@ -2680,7 +2432,7 @@ class MainWindow(QMainWindow):
                 if (nb0, nb1) != (b0, b1):
                     struct.pack_into('>2H', data, off + 16, nb0, nb1)
                     changed += int(nb0 != b0) + int(nb1 != b1)
-            else:  # blend76, blend52, blend60 -- four u16 bone slots at +24..+32
+            else:
                 if off + 32 > len(data):
                     continue
                 slots = struct.unpack_from('>4H', data, off + 24)
@@ -2728,8 +2480,6 @@ class MainWindow(QMainWindow):
         if not self.viewer.uvs or not self.viewer.triangles:
             self.statusBar().showMessage('No UVs available for this model.', 4000)
             return
-        # Prefer the _M (monster) texture as the backdrop; fall back to whatever
-        # is currently active.
         tex_img = None
         for suffix in ('C', 'M', 'B', 'S'):
             try:
@@ -2741,8 +2491,6 @@ class MainWindow(QMainWindow):
                 break
         if self._uv_dialog is None:
             self._uv_dialog = UVMapDialog(self)
-        # GL UVs were stored as (u, raw_v) where v=0 is the top of the image,
-        # which is exactly what QPainter expects, so no flip needed.
         self._uv_dialog.populate(
             tex_img, self.viewer.uvs, self.viewer.triangles, self._tri_groups,
         )
@@ -2777,7 +2525,6 @@ class MainWindow(QMainWindow):
         self.active_texture_suffix = None
         self._preview_mode = True
         self.viewer.set_texture_image(composite)
-        # Hide thumbnail in game-preview mode (per spec).
         self._show_texture_preview(None)
         self.statusBar().showMessage(f'Game preview: {info}', 6000)
 
@@ -2797,12 +2544,8 @@ class MainWindow(QMainWindow):
         size = base.size
         out = base.convert('RGBA').copy()
 
-        # Bump: use luminance only (the RGB565 normal data has green/red tints
-        # that would otherwise color-shift the diffuse).
         if 'B' in layers and 'C' in layers:
             bump_lum = layers['B'].resize(size, Image.LANCZOS).convert('L')
-            # Center around mid-gray so brighter bump areas highlight and darker
-            # areas shade, without globally darkening or rainbow-tinting.
             bump_rgb = Image.merge('RGB', (bump_lum, bump_lum, bump_lum))
             shaded = ImageChops.multiply(out.convert('RGB'),
                                          bump_rgb.point(lambda v: 96 + (v * 159) // 255))
@@ -2810,11 +2553,8 @@ class MainWindow(QMainWindow):
             shaded_rgba.putalpha(out.split()[3])
             out = Image.blend(out, shaded_rgba, 0.45)
 
-        # Shader / spec: I8 grayscale shading map. Multiply (darken in unlit
-        # crevices) at low strength so it does NOT bleach the model.
         if 'S' in layers:
             shade = layers['S'].resize(size, Image.LANCZOS).convert('L')
-            # Remap so 128 = no-op, brighter slightly lifts, darker slightly darkens.
             shade_rgb = Image.merge('RGB', (shade, shade, shade))
             mult = ImageChops.multiply(out.convert('RGB'),
                                        shade_rgb.point(lambda v: 160 + (v * 95) // 255))
@@ -2853,9 +2593,6 @@ class MainWindow(QMainWindow):
         if not self.shape_path:
             QMessageBox.information(self, 'Texture', 'Open a Shapes.BDG first.')
             return
-        # Suggest the model's stem + suffix as the default filename so users
-        # don't have to type it. Open a Qt (non-native) dialog so it isn't
-        # forced fullscreen on some platforms.
         stem = re.sub(r'(?i)_shapes\.bdg$', '', self.shape_path.name)
         suggested = str(self.shape_path.parent / f'{stem}_{suffix}.png')
         png_path, _ = QFileDialog.getOpenFileName(
