@@ -423,6 +423,10 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self.edit_target = 'vertex'
         self.selected_verts: set[int] = set()
         self.selected_bones: set[int] = set()
+        self.uv_highlight_verts: set[int] = set()
+        self.on_3d_selection_changed = None
+        self.on_context_menu = None
+        self._rmb_press_pos: QPoint | None = None
         self.vertex_src: list[tuple[int, int, str]] = []
         self.src_to_render: dict[tuple[int, int], list[int]] = {}
         self.bone_record_offsets: list[int] = []
@@ -474,6 +478,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self.setMinimumSize(640, 480)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
@@ -542,6 +547,14 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._frame_action_next = 'frame'
         self._mesh_dirty = True
         self.update()
+
+    def _fire_3d_selection_changed(self):
+        if callable(self.on_3d_selection_changed) and self.edit_target == 'vertex':
+            self.on_3d_selection_changed(set(self.selected_verts))
+
+    def _show_context_menu(self, global_pos: QPoint):
+        if callable(self.on_context_menu):
+            self.on_context_menu(global_pos)
 
     def set_skeleton(self, positions, parents):
         self.bone_positions = list(positions)
@@ -895,6 +908,21 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glEnable(GL.GL_LIGHTING)
 
+        if not self.edit_mode and self.uv_highlight_verts:
+            GL.glDisable(GL.GL_LIGHTING)
+            GL.glDisable(GL.GL_TEXTURE_2D)
+            GL.glDisable(GL.GL_DEPTH_TEST)
+            GL.glPointSize(6.0)
+            GL.glColor3f(0.2, 1.0, 0.6)
+            GL.glBegin(GL.GL_POINTS)
+            for vid in self.uv_highlight_verts:
+                if 0 <= vid < len(self.vertices):
+                    vx, vy, vz = self.vertices[vid]
+                    GL.glVertex3f(vx, vy, vz)
+            GL.glEnd()
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glEnable(GL.GL_LIGHTING)
+
         if self.edit_mode:
             self._depth_buffer = self._read_depth_snapshot(w, h)
             GL.glDisable(GL.GL_LIGHTING)
@@ -921,6 +949,15 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     GL.glColor3f(1.0, 0.55, 0.15)
                     GL.glBegin(GL.GL_POINTS)
                     for vid in self.selected_verts:
+                        if 0 <= vid < len(self.vertices):
+                            vx, vy, vz = self.vertices[vid]
+                            GL.glVertex3f(vx, vy, vz)
+                    GL.glEnd()
+                if self.uv_highlight_verts:
+                    GL.glPointSize(6.0)
+                    GL.glColor3f(0.2, 1.0, 0.6)
+                    GL.glBegin(GL.GL_POINTS)
+                    for vid in self.uv_highlight_verts:
                         if 0 <= vid < len(self.vertices):
                             vx, vy, vz = self.vertices[vid]
                             GL.glVertex3f(vx, vy, vz)
@@ -1174,9 +1211,11 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._marquee_end = p
             self.update()
             return
-        if e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton) and self._spin_stage:
+        if e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton) and self._spin_stage:
             self._spin_stage = 0
             self._yaw_velocity = 0.0
+        if e.button() == Qt.MouseButton.RightButton:
+            self._rmb_press_pos = e.position().toPoint()
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self._view_gizmo_drag_active:
@@ -1222,6 +1261,14 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._marquee_start = None
             self._marquee_end = None
             self.update()
+            self._fire_3d_selection_changed()
+        if e.button() == Qt.MouseButton.RightButton:
+            press = getattr(self, '_rmb_press_pos', None)
+            if press is not None:
+                release = e.position().toPoint()
+                if abs(release.x() - press.x()) + abs(release.y() - press.y()) < 6:
+                    self._show_context_menu(e.globalPosition().toPoint())
+            self._rmb_press_pos = None
         if not (e.buttons() & (Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton | Qt.MouseButton.RightButton)):
             self._last_pos = None
 
@@ -1289,24 +1336,26 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         dy = p.y() - self._last_pos.y()
         self._last_pos = p
         buttons = e.buttons()
-        if buttons & Qt.MouseButton.LeftButton:
-            self._target_yaw = (self._target_yaw + dx * 0.5) % 360
-            self._target_pitch = max(-89.0, min(89.0, self._target_pitch + dy * 0.5))
-            self._arm_frame_next()
-        elif buttons & Qt.MouseButton.RightButton:
-            yaw_rad = math.radians(self.yaw)
-            pitch_rad = math.radians(self.pitch)
-            cy_, sy_ = math.cos(yaw_rad), math.sin(yaw_rad)
-            cp_, sp_ = math.cos(pitch_rad), math.sin(pitch_rad)
-            right_axis = (cy_, 0.0, sy_)
-            up_axis = (sy_ * sp_, cp_, -cy_ * sp_)
-            self._apply_model_rotation(up_axis, dx * 0.5)
-            self._apply_model_rotation(right_axis, dy * 0.5)
-        elif buttons & Qt.MouseButton.MiddleButton:
-            scale = self.radius * self.zoom * 0.0025
-            self._target_pan_x += dx * scale
-            self._target_pan_y -= dy * scale
-            self._arm_frame_next()
+        mods = e.modifiers()
+        if buttons & Qt.MouseButton.MiddleButton:
+            if mods & Qt.KeyboardModifier.AltModifier:
+                yaw_rad = math.radians(self.yaw)
+                pitch_rad = math.radians(self.pitch)
+                cy_, sy_ = math.cos(yaw_rad), math.sin(yaw_rad)
+                cp_, sp_ = math.cos(pitch_rad), math.sin(pitch_rad)
+                right_axis = (cy_, 0.0, sy_)
+                up_axis = (sy_ * sp_, cp_, -cy_ * sp_)
+                self._apply_model_rotation(up_axis, dx * 0.5)
+                self._apply_model_rotation(right_axis, dy * 0.5)
+            elif mods & Qt.KeyboardModifier.ShiftModifier:
+                scale = self.radius * self.zoom * 0.0025
+                self._target_pan_x += dx * scale
+                self._target_pan_y -= dy * scale
+                self._arm_frame_next()
+            else:
+                self._target_yaw = (self._target_yaw + dx * 0.5) % 360
+                self._target_pitch = max(-89.0, min(89.0, self._target_pitch + dy * 0.5))
+                self._arm_frame_next()
 
     def wheelEvent(self, e):
         delta = e.angleDelta().y() / 120.0
@@ -1520,6 +1569,13 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self._apply_model_rotation(world_axis, angle)
         self._view_drag_start = current
 
+    def event(self, e):
+        from PyQt6.QtCore import QEvent
+        if e.type() == QEvent.Type.KeyPress and e.key() == Qt.Key.Key_Tab and self.edit_mode:
+            self.keyPressEvent(e)
+            return True
+        return super().event(e)
+
     def keyPressEvent(self, e):
         key = e.key()
         if self.edit_mode:
@@ -1547,6 +1603,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     return
                 self.selected_verts.clear()
                 self.selected_bones.clear()
+                self._fire_3d_selection_changed()
                 self.update()
                 return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -1589,6 +1646,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 return
             if key == Qt.Key.Key_A:
                 self.select_all_in_target()
+                self._fire_3d_selection_changed()
                 self.update()
                 return
             if key == Qt.Key.Key_V:
@@ -1602,6 +1660,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     if seed is not None:
                         self.selected_verts.clear()
                 self.select_linked(seed)
+                self._fire_3d_selection_changed()
                 return
             if key == Qt.Key.Key_L and self.edit_target == 'bone':
                 if self.selected_bones:
@@ -1614,6 +1673,11 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                             self.bone_locked.discard(bid)
                     self.update()
                 return
+            if key == Qt.Key.Key_Tab and self.edit_target == 'vertex':
+                if not (self._grab_active or self._rotate_active):
+                    if self.cycle_edge_selection():
+                        self._fire_3d_selection_changed()
+                        return
         if key == Qt.Key.Key_E:
             super().keyPressEvent(e)
             return
@@ -1658,10 +1722,13 @@ _UV_GROUP_COLORS = [
 
 
 class UVMapView(QWidget):
+    uv_changed = None  # callback(new_uvs) when UVs are moved
+    selection_changed = None  # callback(selected_vert_ids: set) when selection changes
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(QSize(420, 420))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._tex_pixmap: QPixmap | None = None
         self._uvs: list[tuple[float, float]] = []
         self._tris: list[tuple[int, int, int]] = []
@@ -1671,9 +1738,25 @@ class UVMapView(QWidget):
         self._show_fill = False
         self._zoom = 1.0
         self._pan = QPoint(0, 0)
-        self._dragging = False
-        self._last_drag: QPoint | None = None
+        self._panning = False
+        self._last_pan: QPoint | None = None
         self.setMouseTracking(True)
+        self._last_mouse = QPoint(0, 0)
+        # Selection
+        self._selected: set[int] = set()
+        self._cycle_pool: list[int] = []
+        self._cycle_index: int = 0
+        self._marquee_active = False
+        self._marquee_start: QPoint | None = None
+        self._marquee_end: QPoint | None = None
+        # Grab mode
+        self._grabbing = False
+        self._grab_start: QPoint | None = None
+        self._grab_origin_uvs: dict[int, tuple[float, float]] = {}
+        self._grab_axis: str | None = None  # None = free, 'x' or 'y'
+        # Undo
+        self._undo_stack: list[list[tuple[float, float]]] = []
+        self._redo_stack: list[list[tuple[float, float]]] = []
 
     def set_data(self, tex_image, uvs, tris, groups):
         if tex_image is not None:
@@ -1690,6 +1773,10 @@ class UVMapView(QWidget):
         self._tris = list(tris)
         self._groups = list(groups) if groups else [0] * len(tris)
         self._uv_bounds = (0.0, 0.0, 1.0, 1.0)
+        self._selected.clear()
+        self._cancel_grab()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
         self.reset_view()
 
     def set_show_texture(self, on: bool):
@@ -1705,6 +1792,88 @@ class UVMapView(QWidget):
         self._pan = QPoint(0, 0)
         self.update()
 
+    def _push_undo(self):
+        self._undo_stack.append([tuple(uv) for uv in self._uvs])
+        if len(self._undo_stack) > 80:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append([tuple(uv) for uv in self._uvs])
+        self._uvs = self._undo_stack.pop()
+        self._notify_changed()
+        self.update()
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append([tuple(uv) for uv in self._uvs])
+        self._uvs = self._redo_stack.pop()
+        self._notify_changed()
+        self.update()
+
+    def _notify_changed(self):
+        if callable(self.uv_changed):
+            self.uv_changed(self._uvs)
+
+    def _notify_selection(self):
+        if callable(self.selection_changed):
+            self.selection_changed(set(self._selected))
+
+    def _cancel_grab(self):
+        if self._grabbing and self._grab_origin_uvs:
+            for vid, orig in self._grab_origin_uvs.items():
+                self._uvs[vid] = orig
+        self._grabbing = False
+        self._grab_start = None
+        self._grab_origin_uvs = {}
+        self._grab_axis = None
+        self.update()
+
+    def _confirm_grab(self):
+        if not self._grabbing:
+            return
+        self._grabbing = False
+        self._grab_start = None
+        self._grab_origin_uvs = {}
+        self._grab_axis = None
+        self._notify_changed()
+        self.update()
+
+    def _start_grab(self):
+        if not self._selected:
+            return
+        self._push_undo()
+        self._grabbing = True
+        self._grab_start = self._last_mouse
+        self._grab_axis = None
+        self._grab_origin_uvs = {vid: self._uvs[vid] for vid in self._selected}
+
+    # --- Coordinate transforms ---
+
+    def _screen_to_uv(self, pos: QPoint) -> tuple[float, float]:
+        ox, oy, side = self._texture_rect()
+        if side < 1e-6:
+            return (0.0, 0.0)
+        u = (pos.x() - ox) / side
+        v = (pos.y() - oy) / side
+        return (u, v)
+
+    def _uv_to_screen(self, uv: tuple[float, float]) -> tuple[float, float]:
+        ox, oy, side = self._texture_rect()
+        return (ox + uv[0] * side, oy + uv[1] * side)
+
+    # --- Events ---
+
+    def event(self, e):
+        from PyQt6.QtCore import QEvent
+        if e.type() == QEvent.Type.KeyPress and e.key() == Qt.Key.Key_Tab:
+            self.keyPressEvent(e)
+            return True
+        return super().event(e)
+
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
         if delta == 0:
@@ -1714,22 +1883,197 @@ class UVMapView(QWidget):
         self.update()
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._last_drag = e.position().toPoint()
+        self._last_mouse = e.position().toPoint()
+        if e.button() == Qt.MouseButton.MiddleButton or e.button() == Qt.MouseButton.RightButton:
+            self._panning = True
+            self._last_pan = e.position().toPoint()
+        elif e.button() == Qt.MouseButton.LeftButton:
+            if self._grabbing:
+                self._confirm_grab()
+            else:
+                self._marquee_active = True
+                self._marquee_start = e.position().toPoint()
+                self._marquee_end = e.position().toPoint()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self._last_drag = None
+        if e.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._panning = False
+            self._last_pan = None
+        elif e.button() == Qt.MouseButton.LeftButton and self._marquee_active:
+            self._marquee_active = False
+            self._finish_marquee(e)
 
     def mouseMoveEvent(self, e):
-        if self._dragging and self._last_drag is not None:
+        self._last_mouse = e.position().toPoint()
+        if self._panning and self._last_pan is not None:
             cur = e.position().toPoint()
-            delta = cur - self._last_drag
+            delta = cur - self._last_pan
             self._pan += delta
-            self._last_drag = cur
+            self._last_pan = cur
             self.update()
+        elif self._marquee_active:
+            self._marquee_end = e.position().toPoint()
+            self.update()
+        elif self._grabbing and self._grab_start is not None:
+            self._apply_grab(e.position().toPoint())
+
+    def _apply_grab(self, cur: QPoint):
+        ox, oy, side = self._texture_rect()
+        if side < 1e-6:
+            return
+        du = (cur.x() - self._grab_start.x()) / side
+        dv = (cur.y() - self._grab_start.y()) / side
+        if self._grab_axis == 'x':
+            dv = 0.0
+        elif self._grab_axis == 'y':
+            du = 0.0
+        for vid, orig in self._grab_origin_uvs.items():
+            self._uvs[vid] = (orig[0] + du, orig[1] + dv)
+        self.update()
+
+    def _finish_marquee(self, e):
+        if self._marquee_start is None or self._marquee_end is None:
+            return
+        mods = e.modifiers()
+        add = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        sx, sy = self._marquee_start.x(), self._marquee_start.y()
+        ex, ey = self._marquee_end.x(), self._marquee_end.y()
+        x0, x1 = min(sx, ex), max(sx, ex)
+        y0, y1 = min(sy, ey), max(sy, ey)
+        is_click = abs(x1 - x0) < 4 and abs(y1 - y0) < 4
+        if is_click:
+            hits = self._pick_vert_or_edge(self._marquee_start)
+            if not add:
+                self._selected.clear()
+            if hits:
+                if hits.issubset(self._selected):
+                    self._selected -= hits
+                else:
+                    self._selected |= hits
+        else:
+            if not add:
+                self._selected.clear()
+            for vid in range(len(self._uvs)):
+                sx2, sy2 = self._uv_to_screen(self._uvs[vid])
+                if x0 <= sx2 <= x1 and y0 <= sy2 <= y1:
+                    self._selected.add(vid)
+        self._marquee_start = None
+        self._marquee_end = None
+        self._cycle_pool = []
+        self._cycle_index = 0
+        self._notify_selection()
+        self.update()
+
+    def _pick_vert_or_edge(self, pos: QPoint) -> set[int]:
+        """Pick by vertex first (tight radius), then fall back to edge pick."""
+        px, py = pos.x(), pos.y()
+        # Try vertex pick first (tight 8px radius)
+        best_vid = None
+        best_vdist = 8.0
+        for vid in range(len(self._uvs)):
+            sx, sy = self._uv_to_screen(self._uvs[vid])
+            d = math.sqrt((sx - px) ** 2 + (sy - py) ** 2)
+            if d < best_vdist:
+                best_vdist = d
+                best_vid = vid
+        if best_vid is not None:
+            return {best_vid}
+        # Fall back to edge pick (wider 6px tolerance)
+        best_edge: tuple[int, int] | None = None
+        best_edist = 6.0
+        for a, b, c in self._tris:
+            if a >= len(self._uvs) or b >= len(self._uvs) or c >= len(self._uvs):
+                continue
+            for v0, v1 in ((a, b), (b, c), (c, a)):
+                d = self._point_to_segment_dist(px, py, v0, v1)
+                if d < best_edist:
+                    best_edist = d
+                    best_edge = (v0, v1)
+        if best_edge is not None:
+            return {best_edge[0], best_edge[1]}
+        return set()
+
+    def _point_to_segment_dist(self, px, py, v0: int, v1: int) -> float:
+        ax, ay = self._uv_to_screen(self._uvs[v0])
+        bx, by = self._uv_to_screen(self._uvs[v1])
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-6:
+            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+        proj_x = ax + t * dx
+        proj_y = ay + t * dy
+        return math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        mods = e.modifiers()
+        if key == Qt.Key.Key_G and not self._grabbing:
+            self._start_grab()
+        elif key == Qt.Key.Key_X and self._grabbing:
+            self._grab_axis = 'x' if self._grab_axis != 'x' else None
+            self._apply_grab(self._last_mouse)
+        elif key == Qt.Key.Key_Y and self._grabbing:
+            self._grab_axis = 'y' if self._grab_axis != 'y' else None
+            self._apply_grab(self._last_mouse)
+        elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            if self._grabbing:
+                self._confirm_grab()
+        elif key == Qt.Key.Key_Escape:
+            if self._grabbing:
+                self._cancel_grab()
+            else:
+                self._selected.clear()
+                self._cycle_pool = []
+                self._notify_selection()
+                self.update()
+        elif key == Qt.Key.Key_A:
+            if self._selected:
+                self._selected.clear()
+            else:
+                self._selected = set(range(len(self._uvs)))
+            self._cycle_pool = []
+            self._notify_selection()
+            self.update()
+        elif key == Qt.Key.Key_Tab and not self._grabbing and (len(self._selected) > 1 or self._cycle_pool):
+            self._cycle_selection()
+        elif key == Qt.Key.Key_L and self._selected:
+            self._select_linked()
+        elif key == Qt.Key.Key_Z and (mods & Qt.KeyboardModifier.ControlModifier):
+            self._undo()
+        elif key == Qt.Key.Key_Y and (mods & Qt.KeyboardModifier.ControlModifier):
+            self._redo()
+        else:
+            super().keyPressEvent(e)
+
+    def _cycle_selection(self):
+        if not self._cycle_pool:
+            self._cycle_pool = sorted(self._selected)
+            self._cycle_index = 0
+        self._selected = {self._cycle_pool[self._cycle_index % len(self._cycle_pool)]}
+        self._cycle_index = (self._cycle_index + 1) % len(self._cycle_pool)
+        self._notify_selection()
+        self.update()
+
+    def _select_linked(self):
+        adj: dict[int, set[int]] = {}
+        for a, b, c in self._tris:
+            adj.setdefault(a, set()).update((b, c))
+            adj.setdefault(b, set()).update((a, c))
+            adj.setdefault(c, set()).update((a, b))
+        frontier = list(self._selected)
+        visited = set(self._selected)
+        while frontier:
+            vid = frontier.pop()
+            for nb in adj.get(vid, ()):
+                if nb not in visited:
+                    visited.add(nb)
+                    frontier.append(nb)
+        self._selected = visited
+        self._notify_selection()
+        self.update()
+
+    # --- Drawing ---
 
     def _texture_rect(self):
         umin, vmin, umax, vmax = self._uv_bounds
@@ -1804,13 +2148,44 @@ class UVMapView(QWidget):
             p.drawLine(int(pa[0]), int(pa[1]), int(pb[0]), int(pb[1]))
             p.drawLine(int(pb[0]), int(pb[1]), int(pc[0]), int(pc[1]))
             p.drawLine(int(pc[0]), int(pc[1]), int(pa[0]), int(pa[1]))
+
+        # Draw selected verts
+        if self._selected:
+            p.setBrush(QColor(255, 160, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            for vid in self._selected:
+                if vid < len(self._uvs):
+                    sx, sy = to_screen(self._uvs[vid])
+                    p.drawEllipse(int(sx) - 3, int(sy) - 3, 6, 6)
+
+        # Draw marquee
+        if self._marquee_active and self._marquee_start and self._marquee_end:
+            pen = QPen(QColor(255, 200, 60, 180))
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setWidthF(1.0)
+            p.setPen(pen)
+            p.setBrush(QColor(255, 200, 60, 30))
+            from PyQt6.QtCore import QRectF
+            r = QRectF(
+                self._marquee_start.x(), self._marquee_start.y(),
+                self._marquee_end.x() - self._marquee_start.x(),
+                self._marquee_end.y() - self._marquee_start.y(),
+            ).normalized()
+            p.drawRect(r)
+
+        # Grab axis indicator
+        if self._grabbing and self._grab_axis:
+            p.setPen(QPen(QColor(255, 80, 80) if self._grab_axis == 'x' else QColor(80, 255, 80), 2))
+            cx, cy = self.width() // 2, self.height() - 20
+            p.drawText(cx - 40, cy, f'Axis lock: {self._grab_axis.upper()}')
+
         p.end()
 
 
 class UVMapDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('UV Map')
+        self.setWindowTitle('UV Map Editor')
         self.resize(640, 720)
         self.view = UVMapView(self)
         self.show_tex = QCheckBox('Show texture', self)
@@ -1822,6 +2197,12 @@ class UVMapDialog(QDialog):
         reset = QPushButton('Reset view', self)
         reset.clicked.connect(self.view.reset_view)
         self.info = QLabel('', self)
+        hint = QLabel(
+            'LMB: select/box  |  G: grab  |  X/Y: axis lock  |  '
+            'Enter: confirm  |  Esc: cancel  |  A: all  |  L: linked  |  '
+            'MMB/RMB: pan  |  Scroll: zoom  |  Ctrl+Z/Y: undo/redo'
+        )
+        hint.setStyleSheet('color: #888; font-size: 11px;')
         controls = QHBoxLayout()
         controls.addWidget(self.show_tex)
         controls.addWidget(self.show_fill)
@@ -1832,6 +2213,7 @@ class UVMapDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(controls)
         layout.addWidget(self.view, 1)
+        layout.addWidget(hint)
 
     def populate(self, tex_image, uvs, tris, groups):
         self.view.set_data(tex_image, uvs, tris, groups)
@@ -1856,6 +2238,8 @@ class MainWindow(QMainWindow):
         self.resize(1024, 720)
 
         self.viewer = MeshViewer()
+        self.viewer.on_3d_selection_changed = self._on_3d_selection_changed
+        self.viewer.on_context_menu = self._open_context_menu
         self._config = load_config()
         self._theme_key = self._config.get('theme', 'dark')
         if self._theme_key not in THEMES:
@@ -1950,9 +2334,10 @@ class MainWindow(QMainWindow):
                 ('Shift+R', 'Reset bones to original'),
                 ('', ''),
                 ('H', 'Toggle this help'),
-                ('LMB', 'Rotate camera'),
-                ('MMB', 'Pan'),
-                ('RMB', 'Rotate model'),
+                ('MMB drag', 'Rotate camera'),
+                ('Shift+MMB', 'Pan camera'),
+                ('Alt+MMB', 'Rotate model'),
+                ('RMB', 'Context menu'),
             ]
         else:
             rows = [
@@ -1969,9 +2354,10 @@ class MainWindow(QMainWindow):
                 ('M', 'Toggle Critical Mass'),
                 ('N', 'Game preview composite'),
                 ('', ''),
-                ('LMB', 'Rotate camera'),
-                ('MMB', 'Pan'),
-                ('RMB', 'Rotate model'),
+                ('MMB drag', 'Rotate camera'),
+                ('Shift+MMB', 'Pan camera'),
+                ('Alt+MMB', 'Rotate model'),
+                ('RMB', 'Context menu'),
             ]
         html = '<table style="font-family:Consolas,monospace;font-size:11px;">'
         for key, desc in rows:
@@ -2073,18 +2459,19 @@ class MainWindow(QMainWindow):
             show = tex_menu.addAction(f'Show _{suffix} - {label}')
             show.triggered.connect(lambda _c=False, s=suffix: self.show_texture(s))
         tex_menu.addSeparator()
+        uv_action = tex_menu.addAction('UV Map Editor...')
+        uv_action.triggered.connect(self.show_uv_map)
         preview_act = tex_menu.addAction('Load Game Preview')
         preview_act.triggered.connect(self.show_game_preview)
         self.crit_mass_action = tex_menu.addAction('Enable Critical Mass')
         self.crit_mass_action.setCheckable(True)
         self.crit_mass_action.toggled.connect(self._on_crit_mass_toggled)
+        clear = tex_menu.addAction('Clear Texture Overlay')
+        clear.triggered.connect(self.clear_texture)
         tex_menu.addSeparator()
         for suffix, label in TEXTURE_SUFFIXES.items():
             rep = tex_menu.addAction(f'Replace _{suffix} from PNG...')
             rep.triggered.connect(lambda _c=False, s=suffix: self.replace_texture(s))
-        tex_menu.addSeparator()
-        clear = tex_menu.addAction('Clear Texture Overlay')
-        clear.triggered.connect(self.clear_texture)
         tex_btn.setMenu(tex_menu)
 
         opt_btn = QToolButton()
@@ -2101,11 +2488,6 @@ class MainWindow(QMainWindow):
         self.uv_overlay_action = opt_menu.addAction('Show UV Map on Model')
         self.uv_overlay_action.setCheckable(True)
         self.uv_overlay_action.toggled.connect(self.viewer.set_show_uv_overlay)
-        opt_menu.addSeparator()
-        uv_action = opt_menu.addAction('Generate UV Map...')
-        uv_action.triggered.connect(self.show_uv_map)
-        opt_menu.addSeparator()
-
         opt_menu.addSeparator()
         theme_menu = opt_menu.addMenu('Theme')
         self._theme_group = QActionGroup(self)
@@ -2356,14 +2738,89 @@ class MainWindow(QMainWindow):
             self.viewer.update()
             self.statusBar().showMessage('Edit mode OFF', 4000)
 
+    def _on_uv_edited(self, new_uvs: list[tuple[float, float]]):
+        if len(new_uvs) == len(self.viewer.uvs):
+            self.viewer.uvs = list(new_uvs)
+            self.viewer._mesh_dirty = True
+            self.viewer.update()
+
+    def _on_uv_selection_changed(self, selected_uv_verts: set[int]):
+        self.viewer.uv_highlight_verts = selected_uv_verts
+        self.viewer.update()
+
+    def _on_3d_selection_changed(self, selected_3d_verts: set[int]):
+        if self._uv_dialog is not None and self._uv_dialog.isVisible():
+            self._uv_dialog.view._selected = set(selected_3d_verts)
+            self._uv_dialog.view.update()
+
+    def _open_context_menu(self, global_pos: QPoint):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            'QMenu { background: #1e2028; color: #e0e0e0; border: 1px solid #3a3d48;'
+            ' padding: 4px 0; font-size: 12px; }'
+            'QMenu::item { padding: 5px 24px 5px 16px; }'
+            'QMenu::item:selected { background: #2d5a8a; }'
+            'QMenu::separator { height: 1px; background: #3a3d48; margin: 4px 8px; }'
+            'QMenu::item:disabled { color: #666; }'
+        )
+
+        # -- Model submenu --
+        model_sub = menu.addMenu('Model')
+        model_sub.addAction('Export (BDG to FBX)').triggered.connect(self.run_export)
+        model_sub.addAction('Import (FBX to BDG)').triggered.connect(self.run_import)
+        model_sub.addSeparator()
+        model_sub.addAction('Reload Model').triggered.connect(self.reload_model)
+        model_sub.addSeparator()
+        edit_act = model_sub.addAction('Edit Mode (E)')
+        edit_act.setCheckable(True)
+        edit_act.setChecked(self.viewer.edit_mode)
+        edit_act.toggled.connect(self._on_edit_mode_toggled)
+        model_sub.addAction('Save Geometry to BDG').triggered.connect(self.save_geometry)
+
+        # -- Texture submenu --
+        tex_sub = menu.addMenu('Texture')
+        for suffix, label in TEXTURE_SUFFIXES.items():
+            act = tex_sub.addAction(f'Show _{suffix} - {label}')
+            act.triggered.connect(lambda _c=False, s=suffix: self.show_texture(s))
+        tex_sub.addSeparator()
+        tex_sub.addAction('UV Map Editor...').triggered.connect(self.show_uv_map)
+        tex_sub.addAction('Game Preview').triggered.connect(self.show_game_preview)
+        crit = tex_sub.addAction('Critical Mass')
+        crit.setCheckable(True)
+        crit.setChecked(self.crit_mass_action.isChecked() if self.crit_mass_action else False)
+        crit.toggled.connect(self._on_crit_mass_toggled)
+        tex_sub.addAction('Clear Texture').triggered.connect(self.clear_texture)
+        tex_sub.addSeparator()
+        for suffix, label in TEXTURE_SUFFIXES.items():
+            act = tex_sub.addAction(f'Replace _{suffix} from PNG...')
+            act.triggered.connect(lambda _c=False, s=suffix: self.replace_texture(s))
+
+        # -- Options submenu --
+        opt_sub = menu.addMenu('Options')
+        wire_act = opt_sub.addAction('Show Wireframe')
+        wire_act.setCheckable(True)
+        wire_act.setChecked(self.viewer.wire_mode != 0)
+        wire_act.toggled.connect(self.viewer.set_wireframe)
+        bone_act = opt_sub.addAction('Show Bones')
+        bone_act.setCheckable(True)
+        bone_act.setChecked(self.viewer.show_bones)
+        bone_act.toggled.connect(self.viewer.set_show_bones)
+        uv_act = opt_sub.addAction('Show UV Map on Model')
+        uv_act.setCheckable(True)
+        uv_act.setChecked(self.viewer.show_uv_overlay)
+        uv_act.toggled.connect(self.viewer.set_show_uv_overlay)
+
+        menu.exec(global_pos)
+
     def save_geometry(self):
         if not self.shape_path or not self.shape_path.exists():
             QMessageBox.information(self, 'Save Geometry', 'Open a Shapes.BDG first.')
             return
         vert_edits = self.viewer.collect_position_writes()
         bone_edits = self.viewer.collect_bone_writes()
+        uv_edits = self.viewer.collect_uv_writes()
         stiff_remap = self._build_stiff_bone_remap()
-        if not vert_edits and not bone_edits and not stiff_remap:
+        if not vert_edits and not bone_edits and not uv_edits and not stiff_remap:
             self.statusBar().showMessage('Nothing to save.', 4000)
             return
         try:
@@ -2375,6 +2832,16 @@ class MainWindow(QMainWindow):
                 stride = {'skin64': 64, 'blend76': 76, 'blend52': 52, 'blend60': 60, 'skin48': 48, 'skin40': 40}.get(layout, 40)
                 off = v_start + src_idx * stride
                 struct.pack_into('>3f', data, off, float(pos[0]), float(pos[1]), float(pos[2]))
+            uv_offset_map = {
+                'skin64': 20, 'blend76': 32,
+                'blend52': 44, 'blend60': 44,
+                'skin48': 32, 'skin40': 32,
+            }
+            for v_start, src_idx, layout, uv in uv_edits:
+                stride = {'skin64': 64, 'blend76': 76, 'blend52': 52, 'blend60': 60, 'skin48': 48, 'skin40': 40}.get(layout, 40)
+                uv_off = uv_offset_map.get(layout, 32)
+                off = v_start + src_idx * stride + uv_off
+                struct.pack_into('>2f', data, off, float(uv[0]), float(1.0 - uv[1]))
             for rec_off, t in bone_edits:
                 if rec_off <= 0 or rec_off + 44 > len(data):
                     continue
@@ -2386,7 +2853,8 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(
             f'Wrote {len(vert_edits)} verts, {len(bone_edits)} bones, '
-            f'{stiff_count} skin slots reweighted to {self.shape_path.name}', 6000,
+            f'{len(uv_edits)} UVs, {stiff_count} skin slots reweighted to '
+            f'{self.shape_path.name}', 6000,
         )
 
     def _build_stiff_bone_remap(self) -> dict[int, int]:
@@ -2491,6 +2959,8 @@ class MainWindow(QMainWindow):
                 break
         if self._uv_dialog is None:
             self._uv_dialog = UVMapDialog(self)
+            self._uv_dialog.view.uv_changed = self._on_uv_edited
+            self._uv_dialog.view.selection_changed = self._on_uv_selection_changed
         self._uv_dialog.populate(
             tex_img, self.viewer.uvs, self.viewer.triangles, self._tri_groups,
         )

@@ -36,6 +36,7 @@ class EditModeMixin:
     def _edit_snapshot(self):
         return {
             'vertices': [tuple(v) for v in self.vertices],
+            'uvs': [tuple(u) for u in getattr(self, 'uvs', [])],
             'bone_locals': [tuple(t) for t in getattr(self, 'bone_locals', [])],
             'bone_locked': set(getattr(self, 'bone_locked', set())),
         }
@@ -44,6 +45,8 @@ class EditModeMixin:
         if not snap:
             return
         self.vertices = [tuple(v) for v in snap['vertices']]
+        if 'uvs' in snap and snap['uvs']:
+            self.uvs = [tuple(u) for u in snap['uvs']]
         if hasattr(self, 'bone_locals'):
             self.bone_locals = [tuple(t) for t in snap['bone_locals']]
             self._recompute_bone_world_positions()
@@ -368,11 +371,31 @@ class EditModeMixin:
         """Single-click selection. Returns True if something was hit."""
         kind, ident = self._pick_at(sx, sy)
         if kind is None:
+            # No vertex hit -- try edge pick before giving up
+            if self.edit_target == 'vertex':
+                edge_ids = self._pick_edge_at(sx, sy)
+                if edge_ids:
+                    target = self.selected_verts
+                    if ctrl:
+                        if edge_ids.issubset(target):
+                            target.difference_update(edge_ids)
+                        else:
+                            target.update(edge_ids)
+                    elif shift:
+                        target.update(edge_ids)
+                    else:
+                        target.clear()
+                        target.update(edge_ids)
+                    self._edge_cycle_pool = sorted(edge_ids)
+                    self._edge_cycle_index = 0
+                    self.update()
+                    return True
             if not (ctrl or shift):
                 if self.edit_target == 'bone':
                     self.selected_bones.clear()
                 else:
                     self.selected_verts.clear()
+                self._edge_cycle_pool = []
                 self.update()
             return False
         if kind == 'bone':
@@ -392,6 +415,70 @@ class EditModeMixin:
         else:
             target.clear()
             target.update(ids)
+        self._edge_cycle_pool = []
+        self.update()
+        return True
+
+    def _pick_edge_at(self, sx: float, sy: float, max_pixels: float = 6.0) -> set[int]:
+        """Pick the closest mesh edge within max_pixels and return both endpoint render-vertex sets."""
+        if not self.triangles or not self.vertex_src:
+            return set()
+        visible = self._visible_source_keys()
+        best_edge: tuple[int, int] | None = None
+        best_dist = max_pixels
+        seen_edges: set[tuple[int, int]] = set()
+        for tri in self.triangles:
+            a, b, c = tri
+            for v0, v1 in ((a, b), (b, c), (c, a)):
+                edge_key = (min(v0, v1), max(v0, v1))
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                if visible:
+                    src0 = self.vertex_src[v0] if v0 < len(self.vertex_src) else None
+                    src1 = self.vertex_src[v1] if v1 < len(self.vertex_src) else None
+                    if src0 is None or src1 is None:
+                        continue
+                    if (src0[0], src0[1]) not in visible or (src1[0], src1[1]) not in visible:
+                        continue
+                p0 = self._project_vertex(self.vertices[v0]) if v0 < len(self.vertices) else None
+                p1 = self._project_vertex(self.vertices[v1]) if v1 < len(self.vertices) else None
+                if p0 is None or p1 is None:
+                    continue
+                d = self._point_to_segment_dist_3d(sx, sy, p0[0], p0[1], p1[0], p1[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_edge = (v0, v1)
+        if best_edge is None:
+            return set()
+        ids: set[int] = set()
+        for vid in best_edge:
+            src = self.vertex_src[vid]
+            key = (src[0], src[1])
+            ids.update(self.src_to_render.get(key, [vid]))
+        return ids
+
+    def _point_to_segment_dist_3d(self, px, py, ax, ay, bx, by) -> float:
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-6:
+            return math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+        proj_x = ax + t * dx
+        proj_y = ay + t * dy
+        return math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+    def cycle_edge_selection(self) -> bool:
+        """Tab-cycle through edge endpoints. Returns True if cycled."""
+        pool = getattr(self, '_edge_cycle_pool', [])
+        if not pool:
+            return False
+        idx = getattr(self, '_edge_cycle_index', 0) % len(pool)
+        vid = pool[idx]
+        src = self.vertex_src[vid]
+        key = (src[0], src[1])
+        self.selected_verts = set(self.src_to_render.get(key, [vid]))
+        self._edge_cycle_index = (idx + 1) % len(pool)
         self.update()
         return True
 
@@ -701,7 +788,7 @@ class EditModeMixin:
             # tolerance that grows with depth so far verts aren't culled by a
             # hard line. Near 0 use a small constant; near 1 (far plane) use up
             # to ~0.01.
-            tol = 0.0002 + win_z * win_z * 0.003
+            tol = 0.001 + win_z * win_z * 0.004
             if win_z <= d + tol:
                 out.add(key)
         return out
@@ -941,6 +1028,21 @@ class EditModeMixin:
                 continue
             seen.add(key)
             out.append((src[0], src[1], src[2], self.vertices[vid]))
+        return out
+
+    def collect_uv_writes(self) -> list[tuple[int, int, str, tuple[float, float]]]:
+        """For each unique source vertex, return (v_start, src_idx, layout, uv)."""
+        out = []
+        seen = set()
+        uvs = getattr(self, 'uvs', [])
+        if not uvs:
+            return out
+        for vid, src in enumerate(self.vertex_src):
+            key = (src[0], src[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((src[0], src[1], src[2], self.uvs[vid]))
         return out
 
     def collect_bone_writes(self) -> list[tuple[int, tuple[float, float, float]]]:
