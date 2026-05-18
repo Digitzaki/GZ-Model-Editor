@@ -39,6 +39,8 @@ class EditModeMixin:
             'uvs': [tuple(u) for u in getattr(self, 'uvs', [])],
             'bone_locals': [tuple(t) for t in getattr(self, 'bone_locals', [])],
             'bone_locked': set(getattr(self, 'bone_locked', set())),
+            'selected_verts': set(self.selected_verts),
+            'selected_bones': set(self.selected_bones),
         }
 
     def _apply_snapshot(self, snap):
@@ -51,6 +53,10 @@ class EditModeMixin:
             self.bone_locals = [tuple(t) for t in snap['bone_locals']]
             self._recompute_bone_world_positions()
         self.bone_locked = set(snap['bone_locked'])
+        if 'selected_verts' in snap:
+            self.selected_verts = set(snap['selected_verts'])
+        if 'selected_bones' in snap:
+            self.selected_bones = set(snap['selected_bones'])
         self._mesh_dirty = True
         self.update()
 
@@ -216,13 +222,27 @@ class EditModeMixin:
             if self._rotate_origin_bone_locals:
                 self._recompute_bone_world_positions()
             self._mesh_dirty = True
+        if getattr(self, '_scale_active', False):
+            for vid, pos in getattr(self, '_scale_origin_positions', {}).items():
+                self.vertices[vid] = pos
+            for bid, t in getattr(self, '_scale_origin_bone_locals', {}).items():
+                self.bone_locals[bid] = t
+            if getattr(self, '_scale_origin_bone_locals', {}):
+                self._recompute_bone_world_positions()
+            self._mesh_dirty = True
         self._grab_axis_mode = None
         self._grab_active = False
         self._rotate_active = False
+        self._scale_active = False
+        self._scale_axis_mode = None
         self._grab_origin_positions.clear()
         self._bone_grab_origin_locals.clear()
         self._rotate_origin_positions.clear()
         self._rotate_origin_bone_locals.clear()
+        if hasattr(self, '_scale_origin_positions'):
+            self._scale_origin_positions.clear()
+        if hasattr(self, '_scale_origin_bone_locals'):
+            self._scale_origin_bone_locals.clear()
         if hasattr(self, '_rotate_origin_bone_world'):
             self._rotate_origin_bone_world.clear()
         if hasattr(self, '_rotate_origin_bone_quats'):
@@ -237,10 +257,16 @@ class EditModeMixin:
         self._grab_axis_mode = None
         self._grab_active = False
         self._rotate_active = False
+        self._scale_active = False
+        self._scale_axis_mode = None
         self._grab_origin_positions.clear()
         self._bone_grab_origin_locals.clear()
         self._rotate_origin_positions.clear()
         self._rotate_origin_bone_locals.clear()
+        if hasattr(self, '_scale_origin_positions'):
+            self._scale_origin_positions.clear()
+        if hasattr(self, '_scale_origin_bone_locals'):
+            self._scale_origin_bone_locals.clear()
         if hasattr(self, '_rotate_origin_bone_world'):
             self._rotate_origin_bone_world.clear()
         if hasattr(self, '_rotate_origin_bone_quats'):
@@ -369,6 +395,7 @@ class EditModeMixin:
 
     def _click_select(self, sx: float, sy: float, ctrl: bool, shift: bool) -> bool:
         """Single-click selection. Returns True if something was hit."""
+        self.push_undo()
         kind, ident = self._pick_at(sx, sy)
         if kind is None:
             # No vertex hit -- try edge pick before giving up
@@ -485,6 +512,7 @@ class EditModeMixin:
     def _select_in_marquee(self, additive: bool):
         if not self._marquee_start or not self._marquee_end:
             return
+        self.push_undo()
         x0 = min(self._marquee_start.x(), self._marquee_end.x())
         x1 = max(self._marquee_start.x(), self._marquee_end.x())
         y0 = min(self._marquee_start.y(), self._marquee_end.y())
@@ -698,6 +726,95 @@ class EditModeMixin:
             self.vertices[vid] = (origin[0] + wx, origin[1] + wy, origin[2] + wz)
         self._mesh_dirty = True
         self.update()
+
+    def _begin_scale(self, anchor: 'QPoint'):
+        """Start a scale operation from the selection pivot."""
+        if self.edit_target == 'bone':
+            if not self.selected_bones:
+                return
+            movable = [bid for bid in self.selected_bones
+                       if 0 <= bid < len(self.bone_locals)
+                       and bid not in self.bone_locked]
+            if not movable:
+                return
+            self.push_undo()
+            self._scale_origin_bone_locals = {
+                bid: self.bone_locals[bid] for bid in movable
+            }
+            xs = [self.bone_positions[bid][0] for bid in movable if 0 <= bid < len(self.bone_positions)]
+            ys = [self.bone_positions[bid][1] for bid in movable if 0 <= bid < len(self.bone_positions)]
+            zs = [self.bone_positions[bid][2] for bid in movable if 0 <= bid < len(self.bone_positions)]
+            if not xs:
+                return
+            self._scale_pivot = (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs))
+        else:
+            if not self.selected_verts:
+                return
+            self.push_undo()
+            self._scale_origin_positions = {
+                vid: self.vertices[vid] for vid in self.selected_verts
+            }
+            xs = [self.vertices[v][0] for v in self.selected_verts]
+            ys = [self.vertices[v][1] for v in self.selected_verts]
+            zs = [self.vertices[v][2] for v in self.selected_verts]
+            self._scale_pivot = (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs))
+        self._scale_active = True
+        self._scale_axis_mode = None
+        self._grab_start = anchor
+
+    def _apply_scale(self, current: 'QPoint'):
+        if not self._scale_active or not self._grab_start:
+            return
+        dx = current.x() - self._grab_start.x()
+        # Scale factor: 1.0 at anchor, grows/shrinks with horizontal drag
+        factor = 1.0 + dx * 0.005
+        if factor < 0.01:
+            factor = 0.01
+        px, py, pz = self._scale_pivot
+        axis = getattr(self, '_scale_axis_mode', None)
+
+        def scale_point(origin):
+            ox, oy, oz = origin
+            sx = px + (ox - px) * (factor if axis in (None, 'x') else 1.0)
+            sy = py + (oy - py) * (factor if axis in (None, 'y') else 1.0)
+            sz = pz + (oz - pz) * (factor if axis in (None, 'z') else 1.0)
+            return (sx, sy, sz)
+
+        if self.edit_target == 'bone':
+            for bid, origin in self._scale_origin_bone_locals.items():
+                if 0 <= bid < len(self.bone_positions):
+                    world_orig = self.bone_positions[bid]
+                    target = scale_point(world_orig)
+                    # Adjust local translation by the world delta
+                    self.bone_locals[bid] = (
+                        origin[0] + (target[0] - world_orig[0]),
+                        origin[1] + (target[1] - world_orig[1]),
+                        origin[2] + (target[2] - world_orig[2]),
+                    )
+            self._recompute_bone_world_positions()
+        else:
+            for vid, origin in self._scale_origin_positions.items():
+                self.vertices[vid] = scale_point(origin)
+            self._mesh_dirty = True
+        self.update()
+
+    def set_scale_axis_mode(self, mode: str):
+        """Switch scale axis constraint. Resets positions so new axis applies from zero."""
+        if mode not in (None, 'x', 'y', 'z'):
+            return
+        self._scale_axis_mode = mode
+        if self._scale_active:
+            for vid, pos in getattr(self, '_scale_origin_positions', {}).items():
+                self.vertices[vid] = pos
+            for bid, t in getattr(self, '_scale_origin_bone_locals', {}).items():
+                self.bone_locals[bid] = t
+            if getattr(self, '_scale_origin_bone_locals', {}):
+                self._recompute_bone_world_positions()
+            self._mesh_dirty = True
+            from PyQt6.QtGui import QCursor
+            cur = self.mapFromGlobal(QCursor.pos())
+            self._grab_start = cur
+            self.update()
 
     def _visible_source_keys(self) -> set[tuple[int, int]]:
         """Set of source-vertex keys whose projected pixel survives the depth
@@ -1125,3 +1242,329 @@ class EditModeMixin:
                 seen.add(key_src)
                 for copy_id in self.src_to_render.get(key_src, [vid]):
                     self.selected_verts.add(copy_id)
+
+    # ------------------------------------------------------------------
+    # Mirror tool
+    # ------------------------------------------------------------------
+
+    def mirror_select(self, axis: str, tolerance: float = 0.01) -> int:
+        """Select the mirrored counterpart verts/bones across the given axis.
+        Finds vertices on the opposite side of the model center and adds them
+        to the selection. Returns the number of new verts added."""
+        px, py, pz = self.center
+        added = 0
+
+        if self.edit_target == 'bone':
+            if not self.selected_bones:
+                return 0
+            new_bones: set[int] = set()
+            for bid in list(self.selected_bones):
+                if bid >= len(self.bone_positions):
+                    continue
+                wp = self.bone_positions[bid]
+                # Compute the mirrored position
+                if axis == 'x':
+                    target = (2.0 * px - wp[0], wp[1], wp[2])
+                elif axis == 'y':
+                    target = (wp[0], 2.0 * py - wp[1], wp[2])
+                else:
+                    target = (wp[0], wp[1], 2.0 * pz - wp[2])
+                # Find the closest bone to the mirrored position
+                best_bid = -1
+                best_dist = float('inf')
+                tol = self.radius * tolerance
+                for i, pos in enumerate(self.bone_positions):
+                    if i == bid:
+                        continue
+                    d = math.sqrt((pos[0]-target[0])**2 + (pos[1]-target[1])**2 + (pos[2]-target[2])**2)
+                    if d < best_dist and d < tol:
+                        best_dist = d
+                        best_bid = i
+                if best_bid >= 0:
+                    new_bones.add(best_bid)
+            added = len(new_bones - self.selected_bones)
+            self.selected_bones.update(new_bones)
+        else:
+            if not self.selected_verts:
+                return 0
+            # Build a spatial lookup of all verts by source key
+            tol = self.radius * tolerance
+            new_verts: set[int] = set()
+            # Collect mirrored targets from selected verts
+            seen_src: set[tuple[int, int]] = set()
+            for vid in list(self.selected_verts):
+                src = self.vertex_src[vid]
+                key = (src[0], src[1])
+                if key in seen_src:
+                    continue
+                seen_src.add(key)
+                ox, oy, oz = self.vertices[vid]
+                if axis == 'x':
+                    target = (2.0 * px - ox, oy, oz)
+                elif axis == 'y':
+                    target = (ox, 2.0 * py - oy, oz)
+                else:
+                    target = (ox, oy, 2.0 * pz - oz)
+                # Find closest unselected source vert to the mirrored position
+                best_vid = -1
+                best_dist = float('inf')
+                checked: set[tuple[int, int]] = set()
+                for i, s in enumerate(self.vertex_src):
+                    skey = (s[0], s[1])
+                    if skey in checked or skey in seen_src:
+                        continue
+                    checked.add(skey)
+                    vx, vy, vz = self.vertices[i]
+                    d = math.sqrt((vx-target[0])**2 + (vy-target[1])**2 + (vz-target[2])**2)
+                    if d < best_dist and d < tol:
+                        best_dist = d
+                        best_vid = i
+                if best_vid >= 0:
+                    src_match = self.vertex_src[best_vid]
+                    match_key = (src_match[0], src_match[1])
+                    for copy_id in self.src_to_render.get(match_key, [best_vid]):
+                        new_verts.add(copy_id)
+            added = len(new_verts - self.selected_verts)
+            self.selected_verts.update(new_verts)
+        self.update()
+        return added
+
+    # ------------------------------------------------------------------
+    # Proportional editing helpers
+    # ------------------------------------------------------------------
+
+    def _compute_proportional_weights(self, radius: float) -> dict[int, float]:
+        """Compute smooth falloff weights for unselected verts within radius
+        of the selection centroid. Returns {vid: weight} where weight in (0,1]."""
+        pivot = self.selection_pivot()
+        if pivot is None:
+            return {}
+        px, py, pz = pivot
+        weights: dict[int, float] = {}
+        if self.edit_target == 'bone':
+            for bid in range(len(self.bone_positions)):
+                if bid in self.selected_bones or bid in self.bone_locked:
+                    continue
+                bx, by, bz = self.bone_positions[bid]
+                d = math.sqrt((bx - px)**2 + (by - py)**2 + (bz - pz)**2)
+                if d < radius:
+                    t = d / radius
+                    w = (1.0 - t * t) ** 2  # smooth falloff
+                    if w > 0.001:
+                        weights[bid] = w
+        else:
+            seen = set()
+            for vid in range(len(self.vertices)):
+                if vid in self.selected_verts:
+                    continue
+                src = self.vertex_src[vid]
+                key = (src[0], src[1])
+                if key in seen:
+                    continue
+                seen.add(key)
+                vx, vy, vz = self.vertices[vid]
+                d = math.sqrt((vx - px)**2 + (vy - py)**2 + (vz - pz)**2)
+                if d < radius:
+                    t = d / radius
+                    w = (1.0 - t * t) ** 2
+                    if w > 0.001:
+                        for copy_id in self.src_to_render.get(key, [vid]):
+                            weights[copy_id] = w
+        return weights
+
+    def _begin_proportional_grab(self, anchor: 'QPoint', radius: float):
+        """Start a grab that also affects nearby unselected verts with falloff."""
+        if self.edit_target == 'bone':
+            if not self.selected_bones:
+                return
+            self.push_undo()
+            movable = [bid for bid in self.selected_bones
+                       if 0 <= bid < len(self.bone_locals)
+                       and bid not in self.bone_locked]
+            if not movable:
+                return
+            self._grab_active = True
+            self._grab_start = anchor
+            self._bone_grab_origin_locals = {
+                bid: self.bone_locals[bid] for bid in movable
+            }
+            self._proportional_active = True
+            self._proportional_radius = radius
+            weights = self._compute_proportional_weights(radius)
+            self._proportional_weights = weights
+            self._proportional_bone_origins = {
+                bid: self.bone_locals[bid] for bid in weights
+            }
+        else:
+            if not self.selected_verts:
+                return
+            self.push_undo()
+            self._grab_active = True
+            self._grab_start = anchor
+            self._grab_origin_positions = {
+                vid: self.vertices[vid] for vid in self.selected_verts
+            }
+            self._proportional_active = True
+            self._proportional_radius = radius
+            weights = self._compute_proportional_weights(radius)
+            self._proportional_weights = weights
+            self._proportional_origins = {
+                vid: self.vertices[vid] for vid in weights
+            }
+
+    def _begin_proportional_rotate(self, anchor: 'QPoint', radius: float):
+        """Start a rotation that also affects nearby unselected verts."""
+        self._begin_rotate(anchor)
+        if not self._rotate_active:
+            return
+        self._proportional_active = True
+        self._proportional_radius = radius
+        weights = self._compute_proportional_weights(radius)
+        self._proportional_weights = weights
+        if self.edit_target == 'bone':
+            self._proportional_bone_origins = {
+                bid: self.bone_locals[bid] for bid in weights
+            }
+        else:
+            self._proportional_origins = {
+                vid: self.vertices[vid] for vid in weights
+            }
+
+    def _begin_proportional_scale(self, anchor: 'QPoint', radius: float):
+        """Start a scale that also affects nearby unselected verts."""
+        self._begin_scale(anchor)
+        if not self._scale_active:
+            return
+        self._proportional_active = True
+        self._proportional_radius = radius
+        weights = self._compute_proportional_weights(radius)
+        self._proportional_weights = weights
+        if self.edit_target == 'bone':
+            self._proportional_bone_origins = {
+                bid: self.bone_locals[bid] for bid in weights
+            }
+        else:
+            self._proportional_origins = {
+                vid: self.vertices[vid] for vid in weights
+            }
+
+    def _apply_proportional_grab(self, current: 'QPoint'):
+        """Apply grab with proportional falloff to nearby verts."""
+        if not self._grab_active or not self._grab_start:
+            return
+        # First apply normal grab
+        self._apply_grab(current)
+        # Then apply proportional falloff to nearby verts
+        if not getattr(self, '_proportional_active', False):
+            return
+        dx = current.x() - self._grab_start.x()
+        dy = current.y() - self._grab_start.y()
+        wx, wy, wz = self._screen_delta_to_world(dx, dy)
+        axis = getattr(self, '_grab_axis_mode', None)
+        if getattr(self, '_gizmo_translate_active', False):
+            axis = getattr(self, '_gizmo_translate_axis', None)
+        if axis == 'x':
+            wy = 0.0; wz = 0.0
+        elif axis == 'y':
+            wx = 0.0; wz = 0.0
+        elif axis == 'z':
+            wx = 0.0; wy = 0.0
+        weights = getattr(self, '_proportional_weights', {})
+        if self.edit_target == 'bone':
+            origins = getattr(self, '_proportional_bone_origins', {})
+            for bid, w in weights.items():
+                orig = origins.get(bid)
+                if orig is None:
+                    continue
+                self.bone_locals[bid] = (
+                    orig[0] + wx * w,
+                    orig[1] + wy * w,
+                    orig[2] + wz * w,
+                )
+            self._recompute_bone_world_positions()
+        else:
+            origins = getattr(self, '_proportional_origins', {})
+            for vid, w in weights.items():
+                orig = origins.get(vid)
+                if orig is None:
+                    continue
+                self.vertices[vid] = (
+                    orig[0] + wx * w,
+                    orig[1] + wy * w,
+                    orig[2] + wz * w,
+                )
+            self._mesh_dirty = True
+        self.update()
+
+    def _apply_proportional_rotate(self, current: 'QPoint'):
+        """Apply rotation with proportional falloff."""
+        if not self._rotate_active or not self._grab_start:
+            return
+        self._apply_rotate(current)
+        if not getattr(self, '_proportional_active', False):
+            return
+        dx = current.x() - self._grab_start.x()
+        angle = math.radians(dx * 0.5)
+        ax, ay, az = self._rotate_axis_world()
+        n = math.sqrt(ax*ax + ay*ay + az*az) or 1.0
+        ax, ay, az = ax/n, ay/n, az/n
+        px, py, pz = self._rotate_pivot
+        weights = getattr(self, '_proportional_weights', {})
+        if self.edit_target != 'bone':
+            origins = getattr(self, '_proportional_origins', {})
+            for vid, w in weights.items():
+                orig = origins.get(vid)
+                if orig is None:
+                    continue
+                a = angle * w
+                c = math.cos(a); s = math.sin(a); t = 1.0 - c
+                R = (
+                    (t*ax*ax + c,      t*ax*ay - s*az, t*ax*az + s*ay),
+                    (t*ax*ay + s*az,   t*ay*ay + c,    t*ay*az - s*ax),
+                    (t*ax*az - s*ay,   t*ay*az + s*ax, t*az*az + c),
+                )
+                x, y, z = orig[0] - px, orig[1] - py, orig[2] - pz
+                self.vertices[vid] = (
+                    R[0][0]*x + R[0][1]*y + R[0][2]*z + px,
+                    R[1][0]*x + R[1][1]*y + R[1][2]*z + py,
+                    R[2][0]*x + R[2][1]*y + R[2][2]*z + pz,
+                )
+            self._mesh_dirty = True
+            self.update()
+
+    def _apply_proportional_scale(self, current: 'QPoint'):
+        """Apply scale with proportional falloff."""
+        if not self._scale_active or not self._grab_start:
+            return
+        self._apply_scale(current)
+        if not getattr(self, '_proportional_active', False):
+            return
+        dx = current.x() - self._grab_start.x()
+        factor = 1.0 + dx * 0.005
+        if factor < 0.01:
+            factor = 0.01
+        px, py, pz = self._scale_pivot
+        axis = getattr(self, '_scale_axis_mode', None)
+        weights = getattr(self, '_proportional_weights', {})
+        if self.edit_target != 'bone':
+            origins = getattr(self, '_proportional_origins', {})
+            for vid, w in weights.items():
+                orig = origins.get(vid)
+                if orig is None:
+                    continue
+                f = 1.0 + (factor - 1.0) * w
+                ox, oy, oz = orig
+                sx = px + (ox - px) * (f if axis in (None, 'x') else 1.0)
+                sy = py + (oy - py) * (f if axis in (None, 'y') else 1.0)
+                sz = pz + (oz - pz) * (f if axis in (None, 'z') else 1.0)
+                self.vertices[vid] = (sx, sy, sz)
+            self._mesh_dirty = True
+            self.update()
+
+    def _cancel_proportional(self):
+        """Clean up proportional state."""
+        self._proportional_active = False
+        self._proportional_weights = {}
+        self._proportional_origins = {}
+        self._proportional_bone_origins = {}
+        self._proportional_radius = 0.0

@@ -86,28 +86,31 @@ Press **E** to enter edit mode. You can edit either vertices or bones.
 * UV changes automatically reflect when textures are enabled
 * Edge selection system with TAB cycling between connected vertices
 
-| Key              | Action                                          |
-| ---------------- | ----------------------------------------------- |
-| E                | Exit edit mode                                  |
-| V                | Toggle between vertex / bone editing            |
-| LMB drag         | Box-select                                      |
-| Shift + LMB drag | Add to selection                                |
-| A                | Select all                                      |
-| L                | Select linked (vertices) / Stiffen bone (bones) |
-| G                | Grab / move selection                           |
-| G then X/Y/Z     | Lock grab to world axis                         |
-| R                | Rotate selection                                |
-| R then X/Y/Z     | Lock rotation to world axis                     |
-| Shift + R        | Reset selected bones to original                |
-| Tab              | Cycle edge-connected vertices                   |
-| Enter            | Confirm transform                               |
-| Esc              | Cancel transform / clear selection              |
-| Ctrl+Z           | Undo                                            |
-| Ctrl+Y           | Redo                                            |
-| H                | Toggle hotkey overlay                           |
-| LMB              | Orbit camera                                    |
-| MMB              | Pan                                             |
-| RMB              | Rotate model                                    |
+| Key | Action |
+|-----|--------|
+| E | Exit edit mode |
+| V | Toggle between vertex / bone editing |
+| LMB drag | Box-select |
+| Shift + LMB drag | Add to selection |
+| A | Select all |
+| L | Select linked (vertices) / Stiffen bone (bones) |
+| G | Grab / move selection |
+| G then X/Y/Z | Lock grab to world axis |
+| R | Rotate selection |
+| R then X/Y/Z | Lock rotation to world axis |
+| S | Scale selection |
+| M | Mirror grid by X/Y/Z |
+| Ctrl + G/S/R | Transform by Proportional Scaling |
+| Shift + G/S/R | Transform by Snap Incrementals |
+| Enter | Confirm transform |
+| Esc | Cancel transform / clear selection |
+| Ctrl+Z | Undo |
+| Ctrl+Y | Redo |
+| H | Toggle hotkey overlay |
+| LMB | Orbit camera |
+| MMB | Pan |
+| RMB | Rotate model |
+
 
 ---
 

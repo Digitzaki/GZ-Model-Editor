@@ -9,6 +9,7 @@ import json
 import math
 import struct
 import shutil
+import zipfile
 import subprocess
 from pathlib import Path
 
@@ -445,6 +446,11 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self._rotate_pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._rotate_origin_positions: dict[int, tuple[float, float, float]] = {}
         self._rotate_origin_bone_locals: dict[int, tuple[float, float, float]] = {}
+        self._scale_active = False
+        self._scale_pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._scale_origin_positions: dict[int, tuple[float, float, float]] = {}
+        self._scale_origin_bone_locals: dict[int, tuple[float, float, float]] = {}
+        self._scale_axis_mode: str | None = None
         self._hover_vert: int | None = None
         self._hover_bone: int | None = None
         self._rotate_axis_mode: str = 'view'
@@ -479,6 +485,18 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+
+        # Snap & proportional editing state
+        self._numeric_overlay_text = None
+        self._snap_translate = 0.1  # world units
+        self._snap_rotate = 5.0    # degrees
+        self._snap_scale = 0.1     # factor step
+        self._proportional_active = False
+        self._proportional_radius = 0.0
+        self._proportional_weights: dict[int, float] = {}
+        self._proportional_origins: dict[int, tuple[float, float, float]] = {}
+        self._proportional_bone_origins: dict[int, tuple[float, float, float]] = {}
+        self._mirror_axis_cycle = 0  # 0=x, 1=y, 2=z
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
@@ -810,6 +828,11 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glTranslatef(self.pan_x, self.pan_y, -dist)
         GL.glRotatef(self.pitch, 1.0, 0.0, 0.0)
         GL.glRotatef(self.yaw, 0.0, 1.0, 0.0)
+        try:
+            self._cached_world_mv = list(GL.glGetFloatv(GL.GL_MODELVIEW_MATRIX).flatten())
+        except Exception:
+            self._cached_world_mv = None
+        GL.glTranslatef(self.model_pan_x, self.model_pan_y, self.model_pan_z)
         if self.show_grid and self.overlay_mode != 2:
             cx_w, cy_w, cz_w = self.center
             GL.glPushMatrix()
@@ -817,11 +840,6 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._draw_grid_and_axes()
             GL.glPopMatrix()
             GL.glEnable(GL.GL_LIGHTING)
-        try:
-            self._cached_world_mv = list(GL.glGetFloatv(GL.GL_MODELVIEW_MATRIX).flatten())
-        except Exception:
-            self._cached_world_mv = None
-        GL.glTranslatef(self.model_pan_x, self.model_pan_y, self.model_pan_z)
         m = self.model_rot
         gl_mat = [
             m[0], m[3], m[6], 0.0,
@@ -930,8 +948,8 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             if self.edit_target == 'vertex':
                 GL.glDisable(GL.GL_DEPTH_TEST)
                 visible = self._visible_source_keys()
-                GL.glPointSize(3.0)
-                GL.glColor3f(0.55, 0.85, 1.0)
+                GL.glPointSize(2.0)
+                GL.glColor3f(0.05, 0.05, 0.05)
                 GL.glBegin(GL.GL_POINTS)
                 seen = set()
                 for vid, src in enumerate(self.vertex_src):
@@ -946,7 +964,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 GL.glEnd()
                 if self.selected_verts:
                     GL.glPointSize(7.0)
-                    GL.glColor3f(1.0, 0.55, 0.15)
+                    GL.glColor3f(1.0, 0.65, 0.1)
                     GL.glBegin(GL.GL_POINTS)
                     for vid in self.selected_verts:
                         if 0 <= vid < len(self.vertices):
@@ -1022,6 +1040,9 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             GL.glEnable(GL.GL_DEPTH_TEST)
             GL.glEnable(GL.GL_LIGHTING)
             self._draw_marquee_overlay(w, h)
+            if self._grab_active or self._rotate_active or self._scale_active:
+                self._numeric_overlay_text = None
+                self._draw_numeric_overlay(w, h)
         else:
             if self._view_gizmo_mode in ('rotate', 'translate'):
                 GL.glDisable(GL.GL_LIGHTING)
@@ -1129,6 +1150,146 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             buf = _struct.unpack(f'{count}f', bytes(raw)[:count * 4])
         return buf, pw, ph
 
+    def _is_shift_held(self) -> bool:
+        from PyQt6.QtWidgets import QApplication
+        return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+    def _get_proportional_frac(self) -> float:
+        win = self.window()
+        return getattr(win, '_proportional_radius_frac', 0.4) if win else 0.4
+
+    def _snap_point(self, p: 'QPoint', mode: str) -> 'QPoint':
+        """Quantize the cursor offset from grab_start to snap increments."""
+        if not self._grab_start:
+            return p
+        dx = p.x() - self._grab_start.x()
+        dy = p.y() - self._grab_start.y()
+        if mode == 'rotate':
+            # Snap to degree increments (each pixel = 0.5 deg)
+            deg_per_px = 0.5
+            snap_deg = self._snap_rotate
+            snap_px = snap_deg / deg_per_px
+            dx = round(dx / snap_px) * snap_px
+        elif mode == 'scale':
+            # Snap to scale factor steps (each pixel = 0.005 factor)
+            factor_per_px = 0.005
+            snap_factor = self._snap_scale
+            snap_px = snap_factor / factor_per_px
+            dx = round(dx / snap_px) * snap_px
+        else:
+            # For grab, snap the world-space result
+            # Use a pixel-grid approach: snap every N pixels
+            h = max(1, self.height())
+            dist = self.radius * 2.5 * self.zoom
+            fov = math.radians(45.0)
+            world_per_pix = (2.0 * dist * math.tan(fov / 2.0)) / h
+            snap_world = self._snap_translate
+            snap_px = snap_world / world_per_pix if world_per_pix > 0 else 10.0
+            dx = round(dx / snap_px) * snap_px
+            dy = round(dy / snap_px) * snap_px
+        return QPoint(self._grab_start.x() + int(dx), self._grab_start.y() + int(dy))
+
+    def _get_transform_info(self) -> tuple[str, str, str] | None:
+        """Return (mode_label, value_str, axis_str) for the current active transform."""
+        if not self._grab_start:
+            return None
+        from PyQt6.QtGui import QCursor
+        cur = self.mapFromGlobal(QCursor.pos())
+        dx = cur.x() - self._grab_start.x()
+        dy = cur.y() - self._grab_start.y()
+
+        if self._grab_active:
+            wx, wy, wz = self._screen_delta_to_world(dx, dy)
+            axis = None
+            if getattr(self, '_gizmo_translate_active', False):
+                axis = getattr(self, '_gizmo_translate_axis', None)
+            elif getattr(self, '_grab_axis_mode', None):
+                axis = self._grab_axis_mode
+            if axis == 'x':
+                wy = 0.0; wz = 0.0
+            elif axis == 'y':
+                wx = 0.0; wz = 0.0
+            elif axis == 'z':
+                wx = 0.0; wy = 0.0
+            if self._is_shift_held():
+                snap = self._snap_translate
+                wx = round(wx / snap) * snap
+                wy = round(wy / snap) * snap
+                wz = round(wz / snap) * snap
+            axis_str = f'  [{axis.upper()}]' if axis else ''
+            prop_str = '  [Proportional]' if getattr(self, '_proportional_active', False) else ''
+            return ('GRAB', f'dX:{wx:+.3f}  dY:{wy:+.3f}  dZ:{wz:+.3f}', axis_str + prop_str)
+
+        if self._rotate_active:
+            angle = dx * 0.5
+            if self._is_shift_held():
+                angle = round(angle / self._snap_rotate) * self._snap_rotate
+            axis = getattr(self, '_rotate_axis_mode', 'view')
+            axis_label = axis.upper() if axis != 'view' else 'View'
+            prop_str = '  [Proportional]' if getattr(self, '_proportional_active', False) else ''
+            return ('ROTATE', f'{angle:+.1f} deg', f'  [{axis_label}]{prop_str}')
+
+        if self._scale_active:
+            factor = 1.0 + dx * 0.005
+            if self._is_shift_held():
+                factor = round(factor / self._snap_scale) * self._snap_scale
+            if factor < 0.01:
+                factor = 0.01
+            axis = getattr(self, '_scale_axis_mode', None)
+            axis_str = f'  [{axis.upper()}]' if axis else ''
+            prop_str = '  [Proportional]' if getattr(self, '_proportional_active', False) else ''
+            return ('SCALE', f'{factor:.3f}x', axis_str + prop_str)
+
+        return None
+
+    def _draw_numeric_overlay(self, w: int, h: int):
+        """Draw transform values in the bottom-right corner during active transforms."""
+        info = self._get_transform_info()
+        if info is None:
+            return
+        mode, value, extra = info
+        # Draw using GL ortho overlay
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPushMatrix()
+        GL.glLoadIdentity()
+        GL.glOrtho(0, w, h, 0, -1, 1)
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        GL.glPushMatrix()
+        GL.glLoadIdentity()
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_TEXTURE_2D)
+        # Background panel
+        panel_w = 280
+        panel_h = 44
+        margin = 12
+        px = w - panel_w - margin
+        py = h - panel_h - margin
+        GL.glColor4f(0.08, 0.09, 0.11, 0.88)
+        GL.glBegin(GL.GL_QUADS)
+        GL.glVertex2f(px, py)
+        GL.glVertex2f(px + panel_w, py)
+        GL.glVertex2f(px + panel_w, py + panel_h)
+        GL.glVertex2f(px, py + panel_h)
+        GL.glEnd()
+        # Border
+        GL.glColor4f(0.4, 0.5, 0.6, 0.7)
+        GL.glLineWidth(1.0)
+        GL.glBegin(GL.GL_LINE_LOOP)
+        GL.glVertex2f(px, py)
+        GL.glVertex2f(px + panel_w, py)
+        GL.glVertex2f(px + panel_w, py + panel_h)
+        GL.glVertex2f(px, py + panel_h)
+        GL.glEnd()
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_LIGHTING)
+        GL.glPopMatrix()
+        GL.glMatrixMode(GL.GL_PROJECTION)
+        GL.glPopMatrix()
+        GL.glMatrixMode(GL.GL_MODELVIEW)
+        # Store text for QPainter overlay (GL bitmap fonts are impractical)
+        self._numeric_overlay_text = (mode, value, extra, px, py, panel_w, panel_h)
+
     def _draw_marquee_overlay(self, w: int, h: int):
         if not self._marquee_active or not self._marquee_start or not self._marquee_end:
             return
@@ -1161,6 +1322,38 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         GL.glPopMatrix()
         GL.glMatrixMode(GL.GL_MODELVIEW)
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        overlay = getattr(self, '_numeric_overlay_text', None)
+        if overlay is None:
+            return
+        mode, value, extra, px, py, panel_w, panel_h = overlay
+        self._numeric_overlay_text = None
+        from PyQt6.QtGui import QFont
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = QFont('Consolas', 10)
+        font.setWeight(QFont.Weight.Bold)
+        p.setFont(font)
+        p.setPen(QColor(255, 180, 60))
+        p.drawText(int(px) + 8, int(py) + 16, mode)
+        font.setWeight(QFont.Weight.Normal)
+        p.setFont(font)
+        p.setPen(QColor(220, 225, 230))
+        p.drawText(int(px) + 8, int(py) + 33, value + extra)
+        snap_hint = ''
+        if self._is_shift_held():
+            if self._grab_active:
+                snap_hint = f'Snap: {self._snap_translate}'
+            elif self._rotate_active:
+                snap_hint = f'Snap: {self._snap_rotate} deg'
+            elif self._scale_active:
+                snap_hint = f'Snap: {self._snap_scale}x'
+        if snap_hint:
+            p.setPen(QColor(120, 200, 120))
+            p.drawText(int(px) + panel_w - 100, int(py) + 16, snap_hint)
+        p.end()
+
     def mousePressEvent(self, e):
         p = e.position().toPoint()
         self._last_pos = p
@@ -1183,9 +1376,10 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 self._view_gizmo_mode = None
                 self.update()
         if self.edit_mode and e.button() == Qt.MouseButton.LeftButton:
-            if self._grab_active or self._rotate_active:
-                # Click while grabbing/rotating = confirm placement.
+            if self._grab_active or self._rotate_active or self._scale_active:
+                # Click while grabbing/rotating/scaling = confirm placement.
                 self._confirm_grab()
+                self._cancel_proportional()
                 self._gizmo_drag_active = False
                 self._gizmo_translate_active = False
                 self._gizmo_translate_axis = None
@@ -1233,6 +1427,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
         if self.edit_mode and e.button() == Qt.MouseButton.LeftButton and self._gizmo_drag_active:
             self._gizmo_drag_active = False
             self._confirm_grab()
+            self._cancel_proportional()
             self._gizmo_mode = 'rotate'
             self.update()
             return
@@ -1240,6 +1435,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._gizmo_translate_active = False
             self._gizmo_translate_axis = None
             self._confirm_grab()
+            self._cancel_proportional()
             self._gizmo_mode = 'translate'
             self.update()
             return
@@ -1260,6 +1456,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             self._marquee_active = False
             self._marquee_start = None
             self._marquee_end = None
+            self._mirror_axis_cycle = 0
             self.update()
             self._fire_3d_selection_changed()
         if e.button() == Qt.MouseButton.RightButton:
@@ -1294,14 +1491,22 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 self._view_hover_arrow = new_arrow
                 self.update()
         if self.edit_mode and self._gizmo_drag_active:
-            self._apply_rotate(p)
+            snap_p = self._snap_point(p, 'rotate') if self._is_shift_held() else p
+            if getattr(self, '_proportional_active', False):
+                self._apply_proportional_rotate(snap_p)
+            else:
+                self._apply_rotate(snap_p)
             self._last_pos = p
             return
         if self.edit_mode and self._gizmo_translate_active:
-            self._apply_grab(p)
+            snap_p = self._snap_point(p, 'grab') if self._is_shift_held() else p
+            if getattr(self, '_proportional_active', False):
+                self._apply_proportional_grab(snap_p)
+            else:
+                self._apply_grab(snap_p)
             self._last_pos = p
             return
-        if self.edit_mode and not self._grab_active and not self._rotate_active and not self._marquee_active:
+        if self.edit_mode and not self._grab_active and not self._rotate_active and not self._scale_active and not self._marquee_active:
             new_ring = None
             new_arrow = None
             if self._gizmo_mode == 'rotate':
@@ -1318,11 +1523,27 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             if updater is not None and updater(float(p.x()), float(p.y())):
                 self.update()
         if self.edit_mode and self._grab_active:
-            self._apply_grab(p)
+            snap_p = self._snap_point(p, 'grab') if self._is_shift_held() else p
+            if getattr(self, '_proportional_active', False):
+                self._apply_proportional_grab(snap_p)
+            else:
+                self._apply_grab(snap_p)
             self._last_pos = p
             return
         if self.edit_mode and self._rotate_active:
-            self._apply_rotate(p)
+            snap_p = self._snap_point(p, 'rotate') if self._is_shift_held() else p
+            if getattr(self, '_proportional_active', False):
+                self._apply_proportional_rotate(snap_p)
+            else:
+                self._apply_rotate(snap_p)
+            self._last_pos = p
+            return
+        if self.edit_mode and self._scale_active:
+            snap_p = self._snap_point(p, 'scale') if self._is_shift_held() else p
+            if getattr(self, '_proportional_active', False):
+                self._apply_proportional_scale(snap_p)
+            else:
+                self._apply_scale(snap_p)
             self._last_pos = p
             return
         if self.edit_mode and self._marquee_active:
@@ -1345,14 +1566,15 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 cp_, sp_ = math.cos(pitch_rad), math.sin(pitch_rad)
                 right_axis = (cy_, 0.0, sy_)
                 up_axis = (sy_ * sp_, cp_, -cy_ * sp_)
-                self._apply_model_rotation(up_axis, dx * 0.5)
-                self._apply_model_rotation(right_axis, dy * 0.5)
+                self._rotate_model_with_pan(up_axis, dx * 0.5)
+                self._rotate_model_with_pan(right_axis, dy * 0.5)
             elif mods & Qt.KeyboardModifier.ShiftModifier:
                 scale = self.radius * self.zoom * 0.0025
                 self._target_pan_x += dx * scale
                 self._target_pan_y -= dy * scale
                 self._arm_frame_next()
             else:
+                self._absorb_pan_into_model_pan()
                 self._target_yaw = (self._target_yaw + dx * 0.5) % 360
                 self._target_pitch = max(-89.0, min(89.0, self._target_pitch + dy * 0.5))
                 self._arm_frame_next()
@@ -1508,6 +1730,42 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     best = axis
         return best
 
+    def _rotate_model_with_pan(self, axis, angle_deg):
+        """Rotate model_rot and adjust model_pan so rotation is around visual center."""
+        ax, ay, az = axis
+        length = math.sqrt(ax*ax + ay*ay + az*az)
+        if length < 1e-9 or abs(angle_deg) < 1e-6:
+            return
+        ax, ay, az = ax/length, ay/length, az/length
+        a = math.radians(angle_deg)
+        c_a = math.cos(a)
+        s_a = math.sin(a)
+        t_a = 1.0 - c_a
+        px, py, pz = self.model_pan_x, self.model_pan_y, self.model_pan_z
+        self.model_pan_x = (t_a*ax*ax + c_a)*px + (t_a*ax*ay - s_a*az)*py + (t_a*ax*az + s_a*ay)*pz
+        self.model_pan_y = (t_a*ax*ay + s_a*az)*px + (t_a*ay*ay + c_a)*py + (t_a*ay*az - s_a*ax)*pz
+        self.model_pan_z = (t_a*ax*az - s_a*ay)*px + (t_a*ay*az + s_a*ax)*py + (t_a*az*az + c_a)*pz
+        self._apply_model_rotation(axis, angle_deg)
+
+    def _absorb_pan_into_model_pan(self):
+        """Convert any view-space pan offset into model_pan so orbit stays centered.
+        Computes Ry(-yaw) * Rx(-pitch) * (pan_x, pan_y, 0) to find the equivalent
+        world-space displacement."""
+        px, py = self.pan_x, self.pan_y
+        if abs(px) < 1e-6 and abs(py) < 1e-6:
+            return
+        yr = math.radians(self.yaw)
+        pr = math.radians(self.pitch)
+        cy_, sy_ = math.cos(yr), math.sin(yr)
+        cp_, sp_ = math.cos(pr), math.sin(pr)
+        self.model_pan_x += cy_ * px + sy_ * sp_ * py
+        self.model_pan_y += cp_ * py
+        self.model_pan_z += sy_ * px - cy_ * sp_ * py
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._target_pan_x = 0.0
+        self._target_pan_y = 0.0
+
     def _begin_view_translate(self, axis: str, anchor):
         self._view_gizmo_translate_active = True
         self._view_gizmo_axis = axis
@@ -1566,6 +1824,16 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
             world_axis = (0.0, 1.0, 0.0)
         else:
             world_axis = (0.0, 0.0, 1.0)
+        # Rotate model_pan around the axis so the model stays in place visually
+        a = math.radians(angle)
+        c_a = math.cos(a)
+        s_a = math.sin(a)
+        bx, by, bz = world_axis
+        t_a = 1.0 - c_a
+        px, py, pz = self.model_pan_x, self.model_pan_y, self.model_pan_z
+        self.model_pan_x = (t_a*bx*bx + c_a)*px + (t_a*bx*by - s_a*bz)*py + (t_a*bx*bz + s_a*by)*pz
+        self.model_pan_y = (t_a*bx*by + s_a*bz)*px + (t_a*by*by + c_a)*py + (t_a*by*bz - s_a*bx)*pz
+        self.model_pan_z = (t_a*bx*bz - s_a*by)*px + (t_a*by*bz + s_a*bx)*py + (t_a*bz*bz + c_a)*pz
         self._apply_model_rotation(world_axis, angle)
         self._view_drag_start = current
 
@@ -1589,9 +1857,66 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 ):
                     self.redo_edit()
                     return
+                # Ctrl+G/R/S = proportional edit
+                if key == Qt.Key.Key_G:
+                    has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
+                    if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
+                        from PyQt6.QtGui import QCursor
+                        anchor = self.mapFromGlobal(QCursor.pos())
+                        radius = self.radius * self._get_proportional_frac()
+                        self._begin_proportional_grab(anchor, radius)
+                        self.update()
+                    return
+                if key == Qt.Key.Key_R:
+                    has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
+                    if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
+                        from PyQt6.QtGui import QCursor
+                        anchor = self.mapFromGlobal(QCursor.pos())
+                        radius = self.radius * self._get_proportional_frac()
+                        self._begin_proportional_rotate(anchor, radius)
+                        self.update()
+                    return
+                if key == Qt.Key.Key_S:
+                    has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
+                    if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
+                        from PyQt6.QtGui import QCursor
+                        anchor = self.mapFromGlobal(QCursor.pos())
+                        radius = self.radius * self._get_proportional_frac()
+                        self._begin_proportional_scale(anchor, radius)
+                        self.update()
+                    return
+            # M = Mirror select (cycles x -> y -> z -> none)
+            if key == Qt.Key.Key_M:
+                has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
+                if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
+                    cycle = self._mirror_axis_cycle  # 0=x, 1=y, 2=z, 3=none
+                    if cycle < 3:
+                        axes = ('x', 'y', 'z')
+                        axis = axes[cycle]
+                        added = self.mirror_select(axis)
+                        self._mirror_axis_cycle = cycle + 1
+                        win = self.window()
+                        if hasattr(win, 'statusBar'):
+                            win.statusBar().showMessage(
+                                f'Mirror select: {axis.upper()} axis  (+{added} verts)', 4000)
+                    else:
+                        # "none" = reset back to original selection (undo mirror adds)
+                        self._mirror_axis_cycle = 0
+                        win = self.window()
+                        if hasattr(win, 'statusBar'):
+                            win.statusBar().showMessage('Mirror select: off (cycle reset)', 3000)
+                    self._fire_3d_selection_changed()
+                    self.update()
+                return
             if key == Qt.Key.Key_Escape:
-                if self._grab_active or self._rotate_active:
-                    self._cancel_grab()
+                if self._grab_active or self._rotate_active or self._scale_active:
+                    if getattr(self, '_proportional_active', False):
+                        # Proportional edits touched extra verts; undo restores all.
+                        self._cancel_grab()
+                        self._cancel_proportional()
+                        self.undo_edit()
+                    else:
+                        self._cancel_grab()
                     self._gizmo_drag_active = False
                     self._gizmo_translate_active = False
                     self._gizmo_translate_axis = None
@@ -1601,19 +1926,22 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     self._gizmo_mode = None
                     self.update()
                     return
+                if self.selected_verts or self.selected_bones:
+                    self.push_undo()
                 self.selected_verts.clear()
                 self.selected_bones.clear()
                 self._fire_3d_selection_changed()
                 self.update()
                 return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                if self._grab_active or self._rotate_active:
+                if self._grab_active or self._rotate_active or self._scale_active:
                     self._confirm_grab()
+                    self._cancel_proportional()
                     self.update()
                     return
             if key == Qt.Key.Key_G:
                 has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
-                if has_sel and not self._grab_active and not self._rotate_active:
+                if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
                     self._gizmo_mode = 'translate'
                     self.update()
                     return
@@ -1625,12 +1953,24 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 return
             if key == Qt.Key.Key_R:
                 has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
-                if has_sel and not self._grab_active and not self._rotate_active:
+                if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
                     self._gizmo_mode = 'rotate'
+                    self.update()
+                    return
+            if key == Qt.Key.Key_S:
+                has_sel = bool(self.selected_bones if self.edit_target == 'bone' else self.selected_verts)
+                if has_sel and not self._grab_active and not self._rotate_active and not self._scale_active:
+                    from PyQt6.QtGui import QCursor
+                    anchor = self.mapFromGlobal(QCursor.pos())
+                    self._begin_scale(anchor)
                     self.update()
                     return
             if key in (Qt.Key.Key_X, Qt.Key.Key_Y, Qt.Key.Key_Z):
                 axis = {Qt.Key.Key_X: 'x', Qt.Key.Key_Y: 'y', Qt.Key.Key_Z: 'z'}[key]
+                if self._scale_active:
+                    new_mode = None if self._scale_axis_mode == axis else axis
+                    self.set_scale_axis_mode(new_mode)
+                    return
                 if self._rotate_active:
                     self.set_rotate_axis_mode(axis)
                     return
@@ -1645,6 +1985,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 self.update()
                 return
             if key == Qt.Key.Key_A:
+                self.push_undo()
                 self.select_all_in_target()
                 self._fire_3d_selection_changed()
                 self.update()
@@ -1656,6 +1997,7 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                 seed = self._hover_vert
                 if seed is None and not self.selected_verts:
                     return
+                self.push_undo()
                 if not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier):
                     if seed is not None:
                         self.selected_verts.clear()
@@ -1674,7 +2016,9 @@ class MeshViewer(EditModeMixin, CameraMixin, QOpenGLWidget):
                     self.update()
                 return
             if key == Qt.Key.Key_Tab and self.edit_target == 'vertex':
-                if not (self._grab_active or self._rotate_active):
+                if not (self._grab_active or self._rotate_active or self._scale_active):
+                    if getattr(self, '_edge_cycle_pool', []):
+                        self.push_undo()
                     if self.cycle_edge_selection():
                         self._fire_3d_selection_changed()
                         return
@@ -2286,6 +2630,16 @@ class MainWindow(QMainWindow):
 
         self.apply_theme(self._theme_key)
 
+        # Load saved snap/proportional settings
+        snap_cfg = self._config.get('snap', {})
+        if '_snap_translate' in snap_cfg:
+            self.viewer._snap_translate = snap_cfg['_snap_translate']
+        if '_snap_rotate' in snap_cfg:
+            self.viewer._snap_rotate = snap_cfg['_snap_rotate']
+        if '_snap_scale' in snap_cfg:
+            self.viewer._snap_scale = snap_cfg['_snap_scale']
+        self._proportional_radius_frac = self._config.get('proportional_radius_frac', 0.4)
+
         saved_folder = self._config.get('folder')
         if saved_folder and Path(saved_folder).is_dir():
             self.root = Path(saved_folder)
@@ -2325,6 +2679,11 @@ class MainWindow(QMainWindow):
                 ('G then X/Y/Z', 'Lock grab to world axis'),
                 ('R', 'Rotate selection'),
                 ('R then X/Y/Z', 'Lock rotate to world axis'),
+                ('S', 'Scale selection'),
+                ('S then X/Y/Z', 'Lock scale to world axis'),
+                ('Shift', 'Snap to increment'),
+                ('M', 'Mirror (cycles X/Y/Z axis)'),
+                ('Ctrl+G/R/S', 'Proportional edit (falloff)'),
                 ('Enter', 'Confirm transform'),
                 ('Esc', 'Cancel / clear selection'),
                 ('Ctrl+Z', 'Undo'),
@@ -2489,6 +2848,13 @@ class MainWindow(QMainWindow):
         self.uv_overlay_action.setCheckable(True)
         self.uv_overlay_action.toggled.connect(self.viewer.set_show_uv_overlay)
         opt_menu.addSeparator()
+        # Snap Increments submenu (rebuilt on show for current values)
+        snap_menu = opt_menu.addMenu('Snap Increments (Shift)')
+        snap_menu.aboutToShow.connect(lambda: self._rebuild_snap_menu(snap_menu))
+        # Proportional radius submenu (rebuilt on show)
+        prop_menu = opt_menu.addMenu('Proportional Radius')
+        prop_menu.aboutToShow.connect(lambda: self._rebuild_prop_menu(prop_menu))
+        opt_menu.addSeparator()
         theme_menu = opt_menu.addMenu('Theme')
         self._theme_group = QActionGroup(self)
         self._theme_group.setExclusive(True)
@@ -2647,6 +3013,71 @@ class MainWindow(QMainWindow):
         if not self.crit_mass_action:
             return
         self.crit_mass_action.setChecked(not self.crit_mass_action.isChecked())
+
+    def _rebuild_snap_menu(self, menu):
+        menu.clear()
+        for label, attr, choices in (
+            ('Translate', '_snap_translate', (0.01, 0.05, 0.1, 0.25, 0.5, 1.0)),
+            ('Rotate (deg)', '_snap_rotate', (1.0, 5.0, 10.0, 15.0, 30.0, 45.0)),
+            ('Scale', '_snap_scale', (0.01, 0.05, 0.1, 0.25, 0.5)),
+        ):
+            sub = menu.addMenu(label)
+            current = getattr(self.viewer, attr)
+            for val in choices:
+                act = sub.addAction(str(val))
+                act.setCheckable(True)
+                act.setChecked(val == current)
+                act.triggered.connect(lambda _c=False, a=attr, v=val: self._set_snap(a, v))
+            sub.addSeparator()
+            sub.addAction('Custom...').triggered.connect(
+                lambda _c=False, a=attr, lbl=label: self._set_custom_snap(a, lbl))
+
+    def _rebuild_prop_menu(self, menu):
+        menu.clear()
+        cur_frac = getattr(self, '_proportional_radius_frac', 0.4)
+        for frac_label, frac in (('Small (20%)', 0.2), ('Medium (40%)', 0.4), ('Large (60%)', 0.6), ('Huge (80%)', 0.8)):
+            act = menu.addAction(frac_label)
+            act.setCheckable(True)
+            act.setChecked(abs(frac - cur_frac) < 0.01)
+            act.triggered.connect(lambda _c=False, f=frac: self._set_proportional_radius_frac(f))
+        menu.addSeparator()
+        menu.addAction('Custom...').triggered.connect(self._set_custom_proportional_radius)
+
+    def _set_snap(self, attr: str, value: float):
+        setattr(self.viewer, attr, value)
+        cfg = load_config()
+        cfg.setdefault('snap', {})[attr] = value
+        save_config(cfg)
+        labels = {'_snap_translate': 'Translate', '_snap_rotate': 'Rotate', '_snap_scale': 'Scale'}
+        self.statusBar().showMessage(f'{labels.get(attr, "")} snap: {value}', 3000)
+
+    def _set_custom_snap(self, attr: str, label: str):
+        from PyQt6.QtWidgets import QInputDialog
+        current = getattr(self.viewer, attr, 0.1)
+        val, ok = QInputDialog.getDouble(
+            self, f'Custom {label} Snap', f'Enter {label.lower()} snap increment:',
+            current, 0.001, 1000.0, 4,
+        )
+        if ok:
+            self._set_snap(attr, val)
+
+    def _set_proportional_radius_frac(self, frac: float):
+        cfg = load_config()
+        cfg['proportional_radius_frac'] = frac
+        save_config(cfg)
+        self._proportional_radius_frac = frac
+        self.statusBar().showMessage(f'Proportional radius: {int(frac*100)}% of model', 3000)
+
+    def _set_custom_proportional_radius(self):
+        from PyQt6.QtWidgets import QInputDialog
+        current = getattr(self, '_proportional_radius_frac', 0.4) * 100
+        val, ok = QInputDialog.getDouble(
+            self, 'Custom Proportional Radius',
+            'Enter radius as % of model size (e.g. 40 = 40%):',
+            current, 1.0, 200.0, 1,
+        )
+        if ok:
+            self._set_proportional_radius_frac(val / 100.0)
 
     def pick_folder(self):
         start = str(self.root)
@@ -2809,8 +3240,54 @@ class MainWindow(QMainWindow):
         uv_act.setCheckable(True)
         uv_act.setChecked(self.viewer.show_uv_overlay)
         uv_act.toggled.connect(self.viewer.set_show_uv_overlay)
+        opt_sub.addSeparator()
+        snap_sub = opt_sub.addMenu('Snap Increments (Shift)')
+        for label, attr, choices in (
+            ('Translate', '_snap_translate', (0.01, 0.05, 0.1, 0.25, 0.5, 1.0)),
+            ('Rotate (deg)', '_snap_rotate', (1.0, 5.0, 10.0, 15.0, 30.0, 45.0)),
+            ('Scale', '_snap_scale', (0.01, 0.05, 0.1, 0.25, 0.5)),
+        ):
+            sub = snap_sub.addMenu(label)
+            current = getattr(self.viewer, attr)
+            for val in choices:
+                act = sub.addAction(str(val))
+                act.setCheckable(True)
+                act.setChecked(val == current)
+                act.triggered.connect(lambda _c=False, a=attr, v=val: self._set_snap(a, v))
+            sub.addSeparator()
+            custom_act = sub.addAction('Custom...')
+            custom_act.triggered.connect(lambda _c=False, a=attr, lbl=label: self._set_custom_snap(a, lbl))
+        # Proportional radius
+        prop_sub = opt_sub.addMenu('Proportional Radius')
+        cur_frac = getattr(self, '_proportional_radius_frac', 0.4)
+        for frac_label, frac in (('Small (20%)', 0.2), ('Medium (40%)', 0.4), ('Large (60%)', 0.6), ('Huge (80%)', 0.8)):
+            act = prop_sub.addAction(frac_label)
+            act.setCheckable(True)
+            act.setChecked(abs(frac - cur_frac) < 0.01)
+            act.triggered.connect(lambda _c=False, f=frac: self._set_proportional_radius_frac(f))
+        prop_sub.addSeparator()
+        prop_sub.addAction('Custom...').triggered.connect(self._set_custom_proportional_radius)
 
         menu.exec(global_pos)
+
+    def _backup_file(self, file_path: Path):
+        """Copy file_path into a backups/ subfolder with bak_ prefix (once per original)."""
+        if not file_path.exists():
+            return
+        backup_dir = file_path.parent / 'backups'
+        backup_dir.mkdir(exist_ok=True)
+        backup_name = f'bak_{file_path.name}'
+        backup_dest = backup_dir / backup_name
+        if not backup_dest.exists():
+            shutil.copy2(file_path, backup_dest)
+
+    def _create_shapes_zip(self, bdg_path: Path):
+        """Create/overwrite a _Shapes.zip containing the BDG file."""
+        zip_name = bdg_path.stem + '.zip'
+        zip_path = bdg_path.parent / zip_name
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.write(bdg_path, bdg_path.name)
+        return zip_path
 
     def save_geometry(self):
         if not self.shape_path or not self.shape_path.exists():
@@ -2824,9 +3301,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('Nothing to save.', 4000)
             return
         try:
-            backup = self.shape_path.with_suffix(self.shape_path.suffix + '.bak')
-            if not backup.exists():
-                shutil.copy2(self.shape_path, backup)
+            # Backup the original BDG
+            self._backup_file(self.shape_path)
+            # Backup the original zip if it exists
+            zip_path = self.shape_path.parent / (self.shape_path.stem + '.zip')
+            self._backup_file(zip_path)
+
             data = bytearray(self.shape_path.read_bytes())
             for v_start, src_idx, layout, pos in vert_edits:
                 stride = {'skin64': 64, 'blend76': 76, 'blend52': 52, 'blend60': 60, 'skin48': 48, 'skin40': 40}.get(layout, 40)
@@ -2841,20 +3321,23 @@ class MainWindow(QMainWindow):
                 stride = {'skin64': 64, 'blend76': 76, 'blend52': 52, 'blend60': 60, 'skin48': 48, 'skin40': 40}.get(layout, 40)
                 uv_off = uv_offset_map.get(layout, 32)
                 off = v_start + src_idx * stride + uv_off
-                struct.pack_into('>2f', data, off, float(uv[0]), float(1.0 - uv[1]))
+                struct.pack_into('>2f', data, off, float(uv[0]), float(uv[1]))
             for rec_off, t in bone_edits:
                 if rec_off <= 0 or rec_off + 44 > len(data):
                     continue
                 struct.pack_into('>3f', data, rec_off + 32, float(t[0]), float(t[1]), float(t[2]))
             stiff_count = self._apply_stiff_bone_remap(data, stiff_remap)
             self.shape_path.write_bytes(bytes(data))
+
+            # Create the matching zip
+            created_zip = self._create_shapes_zip(self.shape_path)
         except Exception as exc:
             QMessageBox.critical(self, 'Save failed', str(exc))
             return
         self.statusBar().showMessage(
             f'Wrote {len(vert_edits)} verts, {len(bone_edits)} bones, '
             f'{len(uv_edits)} UVs, {stiff_count} skin slots reweighted to '
-            f'{self.shape_path.name}', 6000,
+            f'{self.shape_path.name} + {created_zip.name}', 6000,
         )
 
     def _build_stiff_bone_remap(self) -> dict[int, int]:
