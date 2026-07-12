@@ -1,132 +1,98 @@
-# Unleashed Kaiju Editor (Indev)
+# Godzilla Blender Converter
 
-A model viewer and editor for Godzilla: Unleashed `.BDG` shape files. View, edit vertices, replace textures, and extract/import models to and from FBX.
+Godzilla Blender Converter is a small standalone bridge for moving Pipeworks Godzilla model files between the game formats and Blender-friendly FBX projects.
 
----
+It is meant for quick import/export work without opening the full editor.
 
-## Installation
+## What It Supports
 
-### Pre-built Release
+- Export Wii/PS2-style `*_Shapes.BDG` files to FBX.
+- Export GameCube `.CMG` files to FBX.
+- Import edited FBX files back into copied BDG or CMG files.
+- Extract textures into the exported project folder.
+- Preserve the original file structure needed for safe writeback.
+- Pack DAMM CMG files ending in `_0.cmg`, `_1.cmg`, or `_2.cmg` back into zip files on import. `_3.cmg` stays as a normal CMG file.
 
-Download the latest `.exe` from the [Releases](https://github.com/Digitzaki/Unleashed-Kaiju-Editor/releases/tag/Indev) tab. No additional setup required - just run it.
+BDG export is currently shapes-only. Animation BDGs are not decoded into the exported FBX project.
 
-### Running from Source
+## Basic Workflow
 
-**Requirements:**
+1. Open `GZ Blender Converter.exe` or run `python bridge_gui.py`.
+2. Use the **Export** tab.
+3. Pick an input model file:
+   - `Character_Shapes.BDG` for Unleashed-style BDG models.
+   - `.CMG` for DAMM/GameCube models.
+4. Pick an output folder.
+5. Click **Export to FBX**.
+6. Open the exported FBX in Blender.
+7. Edit the model.
+8. Use the **Import** tab.
+9. Pick the edited FBX.
+10. Pick the original BDG, CMG, or CMG zip.
+11. Pick an output folder.
+12. Click **Import from FBX**.
 
-* Python 3.10+
-* pip
+The importer writes a new copied game file. It does not overwrite the original model.
 
-**Install dependencies:**
+## Exported Project Folder
 
-```bash
-pip install -r requirements.txt
+Each export goes into its own character folder. A typical export contains:
+
+- `Character.fbx` - the Blender model.
+- `import_log.json` - BDG metadata required for importing BDG edits back.
+- `textures/` - decoded texture images.
+
+Do not delete `import_log.json` if you plan to import BDG edits back into the game format. It tells the importer where the original vertex streams, textures, scale, and file layout came from. CMG import reads this structure from the original CMG or CMG zip instead.
+
+## Blender Notes
+
+- Edit the exported FBX, then save or export it back as FBX.
+- Keep the exported project folder intact.
+- For same-topology BDG edits, move existing mesh data rather than deleting `import_log.json` or rebuilding the project from scratch.
+- New parts can be attached when the importer has enough original layout data to preserve the file safely, but the original game format still controls what can be written back.
+
+## Command Line
+
+Export:
+
+```powershell
+python bridge.py export "C:\path\to\Godzilla_Shapes.BDG" --out "C:\path\to\export_folder"
 ```
 
-The required packages are:
-
-* Pillow
-* PyQt6
-* PyOpenGL
-
-**Launch:**
-
-```bash
-python main.py
+```powershell
+python bridge.py export "C:\path\to\Godzilla2K_0.cmg" --out "C:\path\to\export_folder"
 ```
 
----
+Import:
 
-## How to Use
+```powershell
+python bridge.py import "C:\path\to\edited.fbx" --original "C:\path\to\Godzilla_Shapes.BDG" --out "C:\path\to\reimport_folder"
+```
 
-### Opening Models
+```powershell
+python bridge.py import "C:\path\to\edited.fbx" --original "C:\path\to\Godzilla2K_0.cmg" --out "C:\path\to\reimport_folder"
+```
 
-Use `File > Open` and select a **folder** containing `_Shapes.BDG` files. The dropdown will populate with each character found in that folder, letting you switch between them.
+If the edited FBX is not inside the exported project folder, pass the project folder manually:
 
----
+```powershell
+python bridge.py import "C:\path\to\edited.fbx" --project "C:\path\to\exported_character_folder" --original "C:\path\to\Godzilla_Shapes.BDG" --out "C:\path\to\reimport_folder"
+```
 
-### View Mode
+## Building The EXE
 
-Camera controls:
+From inside the `BDG_Blender_Bridge` folder:
 
-| Input                     | Action                           |
-| ------------------------- | -------------------------------- |
-| Left Mouse Button         | Select vertex / element          |
-| Right Mouse Button        | Open context menu (tabs / tools) |
-| Middle Mouse Drag         | Rotate camera                    |
-| Shift + Middle Mouse Drag | Pan camera                       |
-| Alt + Middle Mouse Drag   | Rotate selected mesh             |
-| Scroll Wheel              | Zoom in / out                    |
+```powershell
+pyinstaller --onefile --windowed --name "GZ Blender Converter" --icon ".\gz.ico" --add-data ".\gz.ico;." --add-data ".\tools;tools" --hidden-import PIL --hidden-import PIL.Image --hidden-import PIL.ImageFile .\bridge_gui.py
+```
 
-Hotkeys:
+`--icon` sets the executable and taskbar icon. The `gz.ico` data entry lets the Tkinter window use the same icon while the program is running.
 
-| Key | Action                                         |
-| --- | ---------------------------------------------- |
-| E   | Enter edit mode                                |
-| R   | Rotate mesh (axis rings)                       |
-| G   | Move mesh (axis arrows)                        |
-| F   | Frame model / Reset view (alternates)          |
-| O   | Cycle auto-orbit speed                         |
-| Z   | Cycle overlays (axes + grid / grid only / off) |
-| T   | Cycle texture (M / B / C / S / off)            |
-| W   | Cycle wireframe (black / colored / off)        |
-| M   | Toggle Critical Mass texture                   |
-| N   | Toggle game preview composite                  |
-| H   | Toggle hotkey overlay                          |
+## Requirements
 
----
+- Python 3.10+
+- PyInstaller only if you want to build the standalone exe.
+- Blender for editing the exported FBX files.
 
-### Edit Mode
-
-Press **E** to enter edit mode. You can edit either vertices or bones.
-
-**New features:**
-
-* Real-time UV editing with live mesh updates
-* UV changes automatically reflect when textures are enabled
-* Edge selection system with TAB cycling between connected vertices
-
-| Key | Action |
-|-----|--------|
-| E | Exit edit mode |
-| V | Toggle between vertex / bone editing |
-| LMB drag | Box-select |
-| Shift + LMB drag | Add to selection |
-| A | Select all |
-| L | Select linked (vertices) / Stiffen bone (bones) |
-| G | Grab / move selection |
-| G then X/Y/Z | Lock grab to world axis |
-| R | Rotate selection |
-| R then X/Y/Z | Lock rotation to world axis |
-| S | Scale selection |
-| M | Mirror grid by X/Y/Z |
-| Ctrl + G/S/R | Transform by Proportional Scaling |
-| Shift + G/S/R | Transform by Snap Incrementals |
-| Enter | Confirm transform |
-| Esc | Cancel transform / clear selection |
-| Ctrl+Z | Undo |
-| Ctrl+Y | Redo |
-| H | Toggle hotkey overlay |
-| LMB | Orbit camera |
-| MMB | Pan |
-| RMB | Rotate model |
-
-
----
-
-### Export / Import
-
-* Export (BDG to FBX) - Extracts the model and textures for use in Blender or other 3D software.
-* Import (FBX to BDG) - Brings edited meshes back into the BDG format.
-
----
-
-### Backups
-
-The tool automatically creates backups of your original `.BDG` files before making any changes, so you can always restore the unmodified data.
-
----
-
-## Credits
-
-* **ItsAiden66** - Model extract/import source code
+The GUI itself uses Tkinter, which is included with the standard Windows Python install.

@@ -14,13 +14,14 @@ TOOL_DIR=Path(__file__).resolve().parent
 if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0,str(TOOL_DIR))
 
-from utils.fbx_to_bdg_import import (
+from fbx_to_bdg_import import (
     clean_windows_folder_arg, find_case_insensitive, patch_textures,
     patch_mesh_from_fbx, patch_skeleton_from_fbx, patch_raw_anims,
 )
 
 def import_one(root: Path, extracted: Path, force=False, patch_unchanged=False, with_skeleton=False):
-    manifest=json.loads((extracted/'decode_manifest.json').read_text(encoding='utf-8'))
+    log_path=extracted/'import_log.json'
+    manifest=json.loads(log_path.read_text(encoding='utf-8'))
     base=extracted.name[:-len('-Kaiju-Extracted')] if extracted.name.endswith('-Kaiju-Extracted') else extracted.name
     out=root/f'{base}-Kaiju-Reimported'
     if out.exists():
@@ -55,7 +56,6 @@ def import_one(root: Path, extracted: Path, force=False, patch_unchanged=False, 
             shutil.copy2(p, out/p.name); copied.append(p.name)
 
     report={
-        'tool_version':'v18_exact_native_raw_animation_import',
         'source_extracted':extracted.name,
         'output':out.name,
         'copied':[staged_shape.name]+(([staged_anim.name] if staged_anim else []))+sorted(set(copied)),

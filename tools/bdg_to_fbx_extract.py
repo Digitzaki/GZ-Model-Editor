@@ -188,9 +188,17 @@ def quat_to_euler_xyz_degrees(q):
 CMD_QUADS=0x80; CMD_TRIS=0x90; CMD_TRI_STRIP=0x98; CMD_TRI_FAN=0xA0
 VALID={CMD_QUADS,CMD_TRIS,CMD_TRI_STRIP,CMD_TRI_FAN}
 def read_display_list(start):
-    pos=start; faces=[]; used=[]
-    while pos < len(D)-3 and D[pos] in VALID:
+    pos=start; faces=[]; used=[]; cmds=0
+    # GX 0x00 is NOP.  Skip NOP padding after a real primitive so editor reload
+    # matches the game after safe in-place topology deletes.
+    while pos < len(D)-3:
+        if D[pos] == 0x00 and cmds > 0:
+            pos += 1
+            continue
+        if D[pos] not in VALID:
+            break
         op=D[pos]; count=struct.unpack('>H',D[pos+1:pos+3])[0]; pos+=3
+        cmds += 1
         verts=[]
         for _ in range(count):
             if pos+6 > len(D): break

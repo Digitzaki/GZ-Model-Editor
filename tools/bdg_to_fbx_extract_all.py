@@ -6,19 +6,15 @@ TOOL_DIR = Path(__file__).resolve().parent
 ROOT_DIR = TOOL_DIR.parent
 for _p in (TOOL_DIR, ROOT_DIR):
     if str(_p) not in sys.path: sys.path.insert(0, str(_p))
-from utils.decode_cmpr import decode_cmpr
-from utils.wii_tex_decode import decode_rgb565, decode_i8
+from decode_cmpr import decode_cmpr
+from wii_tex_decode import decode_rgb565, decode_i8, decode_ia4, decode_ia8, decode_rgb5a3
+from parser_core import PipeworksParser
 
 CMD_QUADS=0x80; CMD_TRIS=0x90; CMD_TRI_STRIP=0x98; CMD_TRI_FAN=0xA0
 VALID_DL={CMD_QUADS,CMD_TRIS,CMD_TRI_STRIP,CMD_TRI_FAN}
 FBX_TICKS_PER_SECOND=46186158000
+BDG_FBX_EXPORT_SCALE=10.0
 
-# FBX Actions are only a Blender preview/export convenience. The exact animation
-# path is native BDG resource replacement through animations_raw/animations_import.
-# Supported preview modes:
-#   native_abs      = write decoded BDG local rotations directly (most conservative)
-#   root_stabilized = v18-style root-only stabilization for Blender viewing
-#   bind_delta      = experimental v19 pose-delta mode; not default
 ANIM_PREVIEW_MODE = os.environ.get('BDG_ANIM_PREVIEW_MODE', 'native_abs').strip().lower()
 if ANIM_PREVIEW_MODE not in ('native_abs', 'root_stabilized', 'bind_delta'):
     ANIM_PREVIEW_MODE = 'native_abs'
@@ -51,8 +47,9 @@ def find_sets(root, all_mode=False):
         base=re.sub(r'_Shapes\.BDG$','',shape.name,flags=re.I)
         anim=find_case(root,base+'.BDG')
         pvms=sorted([p for p in root.iterdir() if p.is_file() and p.suffix.lower()=='.pvm' and (p.name.lower().startswith(base.lower()) or (base=='Mechagodzilla_2' and p.name.lower().startswith('mechagodzilla2')))])
-        if anim: out.append((base,shape,anim,pvms))
-        else: print(f'[skip] {base}: missing {base}.BDG')
+        if not anim:
+            print(f'[mesh-only] {base}: missing {base}.BDG; exporting model without animation clips')
+        out.append((base,shape,anim,pvms))
     return out
 
 def find_strtab(D):
@@ -169,7 +166,13 @@ def norm3(v):
 
 def read_display_list_width(D,start,index_width=6):
     pos=start; faces=[]; used=[]; cmds=0
-    while pos<len(D)-3 and D[pos] in VALID_DL:
+    # Skip NOP padding after the first real primitive.
+    while pos<len(D)-3:
+        if D[pos] == 0x00 and cmds > 0:
+            pos += 1
+            continue
+        if D[pos] not in VALID_DL:
+            break
         op=D[pos]; count=int.from_bytes(D[pos+1:pos+3],'big')
         if count<3 or count>4096 or pos+3+index_width*count>len(D): break
         pos+=3; verts=[]
@@ -179,13 +182,8 @@ def read_display_list_width(D,start,index_width=6):
             elif index_width==3:
                 a,b,c=D[pos],D[pos+1],D[pos+2]; pos+=3
             elif index_width==4:
-                # Some resources use four one-byte attributes per display-list vertex.
-                # Position/normal/uv are still the first three bytes for topology.
                 a,b,c=D[pos],D[pos+1],D[pos+2]; pos+=4
             elif index_width==8:
-                # Biollante detail streams use four duplicated big-endian u16 attributes
-                # per display-list vertex. Position/normal/uv/color indices are the
-                # same value in observed streams; use the first three for topology.
                 a,b,c,d=struct.unpack('>4H',D[pos:pos+8]); pos+=8
             else:
                 raise ValueError('unsupported display-list index width')
@@ -210,9 +208,7 @@ def read_display_list(D,start):
     return read_display_list_width(D,start,6)
 
 def find_display_lists(D):
-    # Supports both normal 16-bit-index display lists (6 bytes per vertex) and
-    # compact 8-bit-index display lists (3 bytes per vertex). The scanner intentionally allows small compact detail streams now; several
-    # kaiju store wings/fins/tips as tiny 3-byte-index display-list islands.
+    # Supports normal 16-bit and compact 8-bit display-list streams.
     out=[]
     for s in range(0x1000,len(D)-100,0x20):
         for index_width in (6,8,4,3):
@@ -233,15 +229,7 @@ def validate_layout(D,vstart,count,layout,bone_count):
     if vstart+count*stride>len(D): return -1
     idxs=list(range(min(count,20))) + ([int(i*(count-1)/49) for i in range(50)] if count>50 else list(range(count)))
     ok=0; total=0
-    # Track the actual values pulled from the alleged normal and UV slots so
-    # we can reject layouts whose offsets land on the wrong fields. The old
-    # gate accepted any 12 bytes whose magnitude squared was in 0.001..20 as
-    # a "normal" and any 8 bytes in -50..50 as a "UV"; both ranges are loose
-    # enough that two layouts can score 1.0 on the same vertex stream and
-    # whichever was tested first wins. That is how garbage UV bytes (the
-    # bytes that are actually a normal vector) leak into the export and
-    # smear the entire atlas across body parts, because normals with
-    # components in [-1,1] are perfectly valid UVs to a GL_REPEAT sampler.
+    # Reject layouts whose normal/UV offsets land on the wrong fields.
     n_mags=[]; uvs_seen=[]
     for idx in sorted(set(idxs)):
         off=vstart+idx*stride
@@ -254,13 +242,12 @@ def validate_layout(D,vstart,count,layout,bone_count):
                 ws=[w0,w1,w2,1-(w0+w1+w2)]
                 cond=all(valid_float(f) for f in [x,y,z,u,v,w0,w1,w2]) and all(-0.05<=wt<=1.05 for wt in ws) and all(s<bone_count for s in slots) and norm_ok(n) and -50<=u<=50 and -50<=v<=50
             elif layout in ('blend52','blend60'):
-                # Compact blended streams: 3 pos floats, 3 stored weights,
-                # 4 u16 bone slots, normal, uv; blend60 has 8 bytes trailing pad.
+                # Compact blended stream; blend60 has trailing pad.
                 x,y,z=struct.unpack('>3f',D[off:off+12]); w0,w1,w2=struct.unpack('>3f',D[off+12:off+24]); slots=struct.unpack('>4H',D[off+24:off+32]); n=struct.unpack('>3f',D[off+32:off+44]); u,v=struct.unpack('>2f',D[off+44:off+52])
                 ws=[w0,w1,w2,1-(w0+w1+w2)]
                 cond=all(valid_float(f) for f in [x,y,z,u,v,w0,w1,w2]) and all(-0.05<=wt<=1.05 for wt in ws) and all(s<bone_count for s in slots) and norm_ok(n) and -50<=u<=50 and -50<=v<=50
             elif layout=='skin48':
-                # Biollante large missing stream: skin40 plus 8 bytes pad.
+                # skin40 plus 8 bytes pad.
                 x,y,z,w=struct.unpack('>4f',D[off:off+16]); b0,b1=struct.unpack('>2H',D[off+16:off+20]); n=struct.unpack('>3f',D[off+20:off+32]); u,v=struct.unpack('>2f',D[off+32:off+40])
                 cond=all(valid_float(f) for f in [x,y,z,w,u,v]) and -0.05<=w<=1.05 and b0<bone_count and b1<bone_count and norm_ok(n) and -50<=u<=50 and -50<=v<=50
             else: # skin40 compact two-influence stream
@@ -279,23 +266,111 @@ def validate_layout(D,vstart,count,layout,bone_count):
     base=ok/max(total,1)
     if base<0.5 or not n_mags:
         return base
-    # Normal-slot tightness: real normals satisfy |n|^2 ~ 1. If most samples
-    # are not close to unit length, the bytes interpreted as a normal are
-    # really position/weights/padding and this layout's UV offset is therefore
-    # also wrong.
     tight=sum(1 for m in n_mags if 0.7<=m<=1.3)/len(n_mags)
-    # UV-slot variance: a real UV channel varies per vertex. If u or v is the
-    # same value at every sampled vertex, the slot is padding or packed ints.
     if uvs_seen:
         us={round(u,4) for u,_ in uvs_seen}; vs={round(v,4) for _,v in uvs_seen}
         varies=1.0 if (len(us)>=max(2,len(uvs_seen)//8) and len(vs)>=max(2,len(uvs_seen)//8)) else 0.4
     else:
         varies=0.0
-    # Combine. base stays the dominant term (a layout still has to parse) but
-    # the multipliers give a strict ordering when two layouts both pass.
     return base*tight*varies
 
+def descriptor_meshes(D,bone_count):
+    """Use type-17 mesh descriptors when present.
+
+    The byte scanner below is intentionally conservative and rejects display
+    lists where many GX records do not use identical position/normal/uv indices.
+    Added topology can be valid while reusing original material/shader attribute
+    indices, so descriptor-owned streams are the better source for edited files.
+    """
+    try:
+        from parser_core import PipeworksParser
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.BDG') as f:
+            f.write(D)
+            tmp=f.name
+        try:
+            parser=PipeworksParser(tmp)
+            entries=parser.parse()
+        finally:
+            try: os.unlink(tmp)
+            except Exception: pass
+    except Exception:
+        return []
+    mesh_res=[e for e in entries if e.get('file_type')==17 and e.get('is_resource')]
+    mesh_main=[e for e in entries if e.get('file_type')==17 and not e.get('is_resource')]
+    if len(mesh_res)!=1 or len(mesh_main)!=1:
+        return []
+    res=mesh_res[0]; main=mesh_main[0]
+    res_start=int(res['offset']); res_size=int(res['size'])
+    B=D[int(main['offset']):int(main['offset'])+int(main['size'])]
+    stride_layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}
+    out=[]; seen=set()
+    for base in range(0,max(0,len(B)-56),4):
+        try:
+            record_count=be32(B,base+0)
+            marker=be32(B,base+4)
+            rel_dl=be32(B,base+8)
+            dl_size=be32(B,base+12)
+            attr_count=be32(B,base+16)
+            v_count=be32(B,base+32)
+            stride=be32(B,base+36)
+            flags=be32(B,base+40)
+            rel_v=be32(B,base+48)
+            v_size=be32(B,base+52)
+        except Exception:
+            continue
+        if attr_count!=3 or stride not in stride_layout:
+            continue
+        if v_count<=0 or v_size!=v_count*stride:
+            continue
+        if not (0<=rel_dl<rel_v<=res_size and rel_v+v_size<=res_size and rel_dl+dl_size==rel_v):
+            continue
+        if (rel_dl,rel_v) in seen:
+            continue
+        dl_start=res_start+rel_dl
+        v_start=res_start+rel_v
+        widths=(3,4,6,8) if marker==0x8 else (6,8,3,4)
+        parsed=None
+        for iw in widths:
+            try:
+                faces,used,end,cmds=read_display_list_width(D,dl_start,iw)
+            except Exception:
+                continue
+            if end!=v_start or cmds<=0 or not used:
+                continue
+            if max(a for a,b,c in used)>=v_count:
+                continue
+            parsed=(iw,faces,used,cmds)
+            break
+        if parsed is None:
+            continue
+        layout=stride_layout[stride]
+        score=validate_layout(D,v_start,v_count,layout,bone_count)
+        if score<0.5:
+            continue
+        iw,faces,used,cmds=parsed
+        seen.add((rel_dl,rel_v))
+        out.append({
+            'dl_start':dl_start,'dl_end':v_start,'used':used,'faces':faces,'cmds':cmds,
+            'min_index':min(a for a,b,c in used),'max_index':max(a for a,b,c in used),
+            'ident':sum(1 for a,b,c in used if a==b==c)/len(used),
+            'index_width':iw,'v_start':v_start,'v_count':v_count,'v_stride':stride,
+            'layout':layout,'validation_score':score,
+            'descriptor_base':int(main['offset'])+base,'descriptor_flags':flags,
+            'descriptor_record_count':record_count,
+        })
+    out.sort(key=lambda sm: sm['dl_start'])
+    return out
+
 def choose_meshes(D,bone_count):
+    desc_sub=descriptor_meshes(D,bone_count)
+    if desc_sub:
+        skipped=[]
+        desc_ranges={(sm['dl_start'],sm['dl_end']) for sm in desc_sub}
+        for dl in find_display_lists(D):
+            if (dl['dl_start'],dl['dl_end']) not in desc_ranges:
+                skipped.append({'display_list_start':hex(dl['dl_start']),'display_list_end':hex(dl['dl_end']),'vertex_count_from_indices':dl['max_index']+1,'best_validation_score':'descriptor_not_used','best_layout':None})
+        return desc_sub,skipped
     sub=[]; skipped=[]
     for dl in find_display_lists(D):
         count=dl['max_index']+1; base_vs=align(dl['dl_end'])
@@ -367,11 +442,55 @@ def parse_vertex_by_layout(D,off,bone_count,layout):
     return parse_skin40(D,off,bone_count)
 
 def texture_entries(D):
+    class _MemoryParser(PipeworksParser):
+        def parse(self):
+            self.file_data = D
+            if self.file_data[0:9].decode('ascii', errors='ignore') != 'Pipeworks':
+                raise ValueError('Not a Pipeworks bundle (header missing)')
+            self.is_big_endian = struct.unpack('<H', self.file_data[0x2C:0x2E])[0] == 0
+            self.string_offset = self.read_long(0x34)
+            self.file_count = self.read_short(0x62)
+            self.metadata_offset = self.read_long(0x64)
+            self.main_data_offset = self.read_long(0x68)
+            self.resource_data_offset = self.read_long(0x70)
+            results = []
+            for i in range(self.file_count):
+                entry_offset = 0x78 + (i * 0x12)
+                file_num = self.read_short(entry_offset)
+                offset = self.read_long(entry_offset + 2)
+                size = self.read_long(entry_offset + 6)
+                res_offset = self.read_long(entry_offset + 10)
+                res_size = self.read_long(entry_offset + 14)
+                name, file_type = self.get_file_info(file_num)
+                results.append({'file_num':file_num,'name':name,'file_type':file_type,'offset':offset+self.main_data_offset,'size':size,'is_resource':False,'toc_entry_offset':entry_offset})
+                if res_size > 0:
+                    results.append({'file_num':file_num,'name':f'{name}.resource','file_type':file_type,'offset':res_offset+self.resource_data_offset,'size':res_size,'is_resource':True,'toc_entry_offset':entry_offset})
+            return results
+
     data_base=be32(D,0x70)
-    count=be32(D,0x60)
     entries=[]
-    # Shapes.BDG resource-location table is 18 bytes from 0x80:
-    # u16 type_or_header, u32 payload_rel, u32 payload_size, u16 resource_id, u32 object_meta, u16 pad.
+    try:
+        parsed=_MemoryParser('<memory>').parse()
+        main_by_file = {int(e['file_num']): e for e in parsed if e.get('file_type') == 9 and not e.get('is_resource')}
+        for e in parsed:
+            if e.get('file_type') != 9 or not e.get('is_resource'):
+                continue
+            size=int(e['size'])
+            name=str(e['name']).split('/',1)[-1].replace('.resource','')
+            main = main_by_file.get(int(e['file_num']))
+            fmt_code = None; w = None; h = None; mip_count = None
+            if main:
+                hdr = D[int(main['offset']):int(main['offset'])+16]
+                if len(hdr) >= 16:
+                    _unk, fmt_code = struct.unpack('>II', hdr[:8])
+                    w, h, mip_count = struct.unpack('>HHH', hdr[8:14])
+            if size>0 and int(e['offset'])+min(size,1)<=len(D):
+                entries.append({'rid':int(e['file_num']),'rel':int(e['offset'])-data_base,'size':size,'abs':int(e['offset']),'type':9,'name':name,'fmt_code':fmt_code,'width':w,'height':h,'mip_count':mip_count})
+        return entries,data_base
+    except Exception:
+        pass
+    count=be32(D,0x60)
+    # Fallback for odd bundles: Shapes.BDG resource-location table is 18 bytes from 0x80.
     for i in range(count):
         off=0x80+i*18
         if off+18>len(D): break
@@ -379,37 +498,89 @@ def texture_entries(D):
         rel,size=struct.unpack('>II',D[off+2:off+10])
         rid=struct.unpack('>H',D[off+10:off+12])[0]
         if size>0 and data_base+rel+min(size,1)<=len(D):
-            if size in (0x2aac0,0xaaaa0,0x58200,0x15560,0x15600) or (typ in (0x68,0x42c) and size>0x10000):
-                entries.append({'rid':rid,'rel':rel,'size':size,'abs':data_base+rel,'type':typ})
+            if size in (0x2aac0,0x2aaa0,0xaaaa0,0x58200,0x15560,0x15600) or (typ in (0x68,0x42c) and size>0x10000):
+                entries.append({'rid':rid,'rel':rel,'size':size,'abs':data_base+rel,'type':typ,'name':f'texture_rid_{rid}'})
     return entries,data_base
 
 def decode_textures(D,strings,outdir,asset_name):
     texdir=outdir/'textures'; texdir.mkdir(parents=True,exist_ok=True)
     entries,data_base=texture_entries(D)
-    # Resource order used by these kaiju shapes: C mip chain, B/normal mip chain, optional unused, S mip chain, M mask mip chain.
-    cmpr=[e for e in entries if e['size']==0x2aac0]
-    rgb=[e for e in entries if e['size']==0xaaaa0]
-    i8=[e for e in entries if e['size'] in (0x15560,0x15600)]
     specs=[]
-    if cmpr: specs.append(('C','CMPR',cmpr[0],512,512))
-    if rgb: specs.append(('B_raw','RGB565',rgb[0],512,512))
-    if len(cmpr)>1: specs.append(('S','CMPR',cmpr[1],512,512))
-    if i8: specs.append(('M','I8',i8[-1],256,256))
+    used=set()
+
+    def named_entry(token):
+        token=token.upper()
+        for e in entries:
+            if e['rid'] in used:
+                continue
+            if token in str(e.get('name','')).upper():
+                used.add(e['rid'])
+                return e
+        return None
+
+    def format_from_entry(e):
+        code = e.get('fmt_code')
+        w = int(e.get('width') or 0)
+        h = int(e.get('height') or 0)
+        if code == 0x02:
+            return 'IA4', w, h
+        if code == 0x03:
+            return 'IA8', w, h
+        if code == 0x04:
+            return 'RGB565', w, h
+        if code == 0x05:
+            return 'RGB5A3', w, h
+        if code == 0x0E:
+            return 'CMPR', w, h
+        size=int(e['size'])
+        if size==0xAAAA0:
+            return 'RGB565',512,512
+        if size in (0x2AAC0,0x2AAA0):
+            return 'CMPR',512,512
+        if size in (0x15560,0x15600):
+            return 'I8',256,256
+        return None,0,0
+
+    def add_named(token,suffix,prop=None):
+        e=named_entry(token)
+        if not e:
+            return
+        fmt,w,h = format_from_entry(e)
+        if not fmt or not w or not h:
+            return
+        specs.append((suffix,fmt,e,w,h,prop))
+
+    add_named('_512_C','C','DiffuseColor')
+    add_named('_512_B','B',None)
+    add_named('_512_S','S','SpecularColor')
+    add_named('_256_M','M',None)
+
+    if not specs:
+        # Fallback order for bundles without texture names.
+        cmpr=[e for e in entries if e['size']==0x2aac0]
+        rgb=[e for e in entries if e['size']==0xaaaa0]
+        i8=[e for e in entries if e['size'] in (0x15560,0x15600)]
+        if cmpr: specs.append(('C','CMPR',cmpr[0],512,512,'DiffuseColor'))
+        if rgb: specs.append(('B','RGB565',rgb[0],512,512,None))
+        if len(cmpr)>1: specs.append(('S','CMPR',cmpr[1],512,512,'SpecularColor'))
+        if i8: specs.append(('M','I8',i8[-1],256,256,None))
     tex_manifest=[]; bindings=[]
-    for suffix,fmt,e,w,h in specs:
+    for suffix,fmt,e,w,h,prop in specs:
         raw=D[e['abs']:]
         try:
             if fmt=='CMPR': img=decode_cmpr(raw[:w*h//2],w,h)
             elif fmt=='RGB565': img=decode_rgb565(raw[:w*h*2],w,h)
+            elif fmt=='RGB5A3': img=decode_rgb5a3(raw[:w*h*2],w,h)
+            elif fmt=='IA4': img=decode_ia4(raw[:w*h],w,h)
+            elif fmt=='IA8': img=decode_ia8(raw[:w*h*2],w,h)
             else: img=decode_i8(raw[:w*h],w,h)
             fn=f'{asset_name}_{suffix}.png'; img.save(texdir/fn)
-            tex_manifest.append({'file':fn,'format':fmt,'rid':e['rid'],'rel':hex(e['rel']),'size':hex(e['size']),'width':w,'height':h})
-            if suffix=='C': bindings.append((asset_name+'_C',f'textures/{fn}','DiffuseColor'))
-            if suffix=='S': bindings.append((asset_name+'_S',f'textures/{fn}','SpecularColor'))
+            tex_manifest.append({'file':fn,'name':e.get('name'),'format':fmt,'rid':e['rid'],'rel':hex(e['rel']),'size':hex(e['size']),'width':w,'height':h})
+            if prop: bindings.append((asset_name+'_'+suffix,f'textures/{fn}',prop))
         except Exception as ex:
             tex_manifest.append({'suffix':suffix,'error':str(ex),'rid':e['rid'],'rel':hex(e['rel'])})
     # Blender normal map from raw B.
-    raw_b=texdir/f'{asset_name}_B_raw.png'
+    raw_b=texdir/f'{asset_name}_B.png'
     if raw_b.exists():
         raw=Image.open(raw_b).convert('RGBA'); normal=Image.new('RGBA',raw.size); sp=raw.load(); dp=normal.load()
         for y in range(raw.height):
@@ -522,7 +693,7 @@ def solve_quat_w_sign(records, target=(0,0,0,1)):
         ref=prev if prev is not None else target
         # Pick the actual rotation branch closest to the reference rotation.
         q=max(c, key=lambda x: abs(dot4(x,ref)))
-        # Use the equivalent representation nearest the previous key for FBX slerp.
+        # Keep quaternion signs continuous for FBX slerp.
         if prev is not None and dot4(q,prev)<0: q=tuple(-v for v in q)
         solved.append(q_normalize(q)); prev=solved[-1]
     return solved
@@ -682,10 +853,7 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
         rid2,rel,size=struct.unpack('>III',D[off:off+12])
         return obj_base+rel,size
     def is_anim_name(n):
-        # v14: names are helpful but not authoritative. Clone/variant kaiju often
-        # keep another monster's animation prefix (Kiryu -> MECHAZILLA_3,
-        # MechaGhidorah -> GHIDORAH), and a few descriptor names point at the
-        # wrong string entirely. Header validation below is the source of truth.
+        # Header validation is authoritative; names are only hints.
         u=n.upper()
         if not u or any(x in u for x in ['MESH','.PWK','.PRX','SHADER','TEXTURE']): return False
         return asset_hint.upper().replace('_','')[:5] in u.replace('_','') or any(k in u for k in ['BAD','IDLE','CREEP','WALK','RUN','8WAY','RUSH','ATTACK','ATK','ROAR','JUMP','THROW','GRAB','BLOCK','HIT','HURT','BEAM','BREATH','SPAWN','TAUNT','VICTORY','STUN','FALL','TURN','DODGE','WAKE','DEATH','BITE','KICK','TAIL','WING','WPN','INTRO','PARRY','BRACE','GRAPPLE','LAUNCH','PRONE','KNOCKDOWN'])
@@ -751,18 +919,8 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
         name=res_name(rid)
         try:
             off,size=res_loc(rid)
-            # v14: discover animation clips by validated BDG animation headers,
-            # not by filename prefix. This recovers whole missing Action stacks
-            # for Kiryu, MechaGhidorah, and other reused-animation monsters.
             if not is_anim_header(off,size): continue
             raw_descriptor_name = name
-            # v15: Do not rename validated animation resources just because the
-            # descriptor uses another kaiju's prefix or an unfamiliar verb.
-            # MechaGhidorah intentionally reuses many GHIDORAH_* clips; older
-            # builds converted some valid names to ANIM_RID_###, which made
-            # the action list painful to use and hid the relationship to the
-            # matching King Ghidorah clips. Only fall back to ANIM_RID for
-            # truly missing/non-animation/skeleton descriptor names.
             bad_name = (not name) or ('SKELETON' in name.upper()) or any(x in name.upper() for x in ['MESH','.PWK','.PRX','SHADER','TEXTURE'])
             if bad_name:
                 name=f'{asset_hint}_ANIM_RID_{rid:03d}'
@@ -788,10 +946,7 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
                 tracks.append(tr)
                 nxt=explicit[i+1]['rel'] if i+1<len(explicit) else None
                 if nxt and nxt>tr['end']:
-                    # Gaps between explicit headers are usually one time-first
-                    # continuation track plus 0/2/4/6 bytes of alignment slop on
-                    # either side. Search all short alignments and keep the
-                    # largest valid continuation.
+                    # Search short alignments for continuation tracks.
                     best=None
                     for lead in (0,2,4,6):
                         for rem in (0,2,4,6):
@@ -836,8 +991,7 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
         except Exception:
             continue
 
-    # v11 local/native debug dump: this is not inferred Blender data; it records
-    # the exact decoded BDG track records that feed the FBX curves.
+    # Native track dump for animation decode debugging.
     native_dump=[]
     for a in decoded:
         native_dump.append({
@@ -854,25 +1008,26 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
     BONE_COUNT=len(bone_names)
     BASE_ID=(int(hashlib.sha1(asset.encode('utf-8')).hexdigest()[:8],16)%1000000000) + 2000000000
     GEOM_ID=BASE_ID+1; MODEL_ID=BASE_ID+2; MAT_ID=BASE_ID+3; SKIN_ID=BASE_ID+4; POSE_ID=BASE_ID+5; TEX_ID_BASE=BASE_ID+100; VID_ID_BASE=BASE_ID+200; BONE_MODEL_BASE=BASE_ID+1000; BONE_ATTR_BASE=BASE_ID+2000; CLUSTER_BASE=BASE_ID+3000; ANIM_ID_BASE=BASE_ID+1000000
-    geometry=Node('Geometry',[PLong(GEOM_ID),PStr(f'Geometry::{asset}_Geometry'),PStr('Mesh')],[Node('Vertices',[ADouble(flat3(vertices))]),Node('PolygonVertexIndex',[AInt(poly_indices)]),Node('GeometryVersion',[PInt(124)]),Node('LayerElementNormal',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('Normals',[ADouble(flat3(normals))])]),Node('LayerElementUV',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('UVChannel_1')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('UV',[ADouble(flat2(uvs))])]),Node('LayerElementMaterial',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('AllSame')]),Node('ReferenceInformationType',[PStr('IndexToDirect')]),Node('Materials',[AInt([0])])]),Node('Layer',[PInt(0)],[Node('Version',[PInt(100)]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementNormal')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementUV')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementMaterial')]),Node('TypedIndex',[PInt(0)])])])])
+    scaled_vertices=[(x*BDG_FBX_EXPORT_SCALE,y*BDG_FBX_EXPORT_SCALE,z*BDG_FBX_EXPORT_SCALE) for x,y,z in vertices]
+    def scaled_matrix(m):
+        out=[list(row) for row in m]
+        out[0][3]*=BDG_FBX_EXPORT_SCALE; out[1][3]*=BDG_FBX_EXPORT_SCALE; out[2][3]*=BDG_FBX_EXPORT_SCALE
+        return out
+    scaled_col_global={i:scaled_matrix(m) for i,m in col_global.items()}
+    scaled_global_pos={i:(p[0]*BDG_FBX_EXPORT_SCALE,p[1]*BDG_FBX_EXPORT_SCALE,p[2]*BDG_FBX_EXPORT_SCALE) for i,p in global_pos.items()}
+    geometry=Node('Geometry',[PLong(GEOM_ID),PStr(f'Geometry::{asset}_Geometry'),PStr('Mesh')],[Node('Vertices',[ADouble(flat3(scaled_vertices))]),Node('PolygonVertexIndex',[AInt(poly_indices)]),Node('GeometryVersion',[PInt(124)]),Node('LayerElementNormal',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('Normals',[ADouble(flat3(normals))])]),Node('LayerElementUV',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('UVChannel_1')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('UV',[ADouble(flat2(uvs))])]),Node('LayerElementMaterial',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('AllSame')]),Node('ReferenceInformationType',[PStr('IndexToDirect')]),Node('Materials',[AInt([0])])]),Node('Layer',[PInt(0)],[Node('Version',[PInt(100)]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementNormal')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementUV')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementMaterial')]),Node('TypedIndex',[PInt(0)])])])])
     mesh_model=Node('Model',[PLong(MODEL_ID),PStr(f'Model::{asset}'),PStr('Mesh')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',0.0,0.0,0.0),p_node('Lcl Rotation','Lcl Rotation','','A',0.0,0.0,0.0),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('DefaultAttributeIndex','int','Integer','',0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])])
     material=Node('Material',[PLong(MAT_ID),PStr(f'Material::{asset}_Material'),PStr('')],[Node('Version',[PInt(102)]),Node('ShadingModel',[PStr('phong')]),Node('MultiLayer',[PInt(0)]),Node('Properties70',children=[p_node('DiffuseColor','Color','','A',0.8,0.8,0.8),p_node('SpecularColor','Color','','A',0.25,0.25,0.25),p_node('BumpFactor','double','Number','A',0.45)])])
     texture_nodes=[]; video_nodes=[]
     for i,(label,rel,prop) in enumerate(tex_bindings):
         tid=TEX_ID_BASE+i; vid=VID_ID_BASE+i; abs_file=str((outdir/rel).resolve())
-        # WrapModeU/V MUST be written explicitly. Without a Properties70
-        # block on the Texture node, FBX importers (Blender, Maya, the
-        # in-app viewer) fall back to CLAMP, which makes any UV outside
-        # 0..1 snap to the texture edge -- causing whole-atlas smears
-        # across body parts whose UV islands legitimately tile or sit
-        # outside the box (gloves, torso plate, boot strapping). 0 = Repeat,
-        # the GX_REPEAT default the original mesh streams target.
+        # Match the game's repeating texture wrap.
         texture_nodes.append(Node('Texture',[PLong(tid),PStr(f'Texture::{label}'),PStr('')],[Node('Type',[PStr('TextureVideoClip')]),Node('Version',[PInt(202)]),Node('TextureName',[PStr(f'Texture::{label}')]),Node('Properties70',children=[p_node('WrapModeU','enum','','',0),p_node('WrapModeV','enum','','',0),p_node('UseMaterial','bool','','',1),p_node('UseMipMap','bool','','',1)]),Node('Media',[PStr(f'Video::{label}')]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)]),Node('ModelUVTranslation',[PDouble(0.0),PDouble(0.0)]),Node('ModelUVScaling',[PDouble(1.0),PDouble(1.0)]),Node('Texture_Alpha_Source',[PStr('None')]),Node('Cropping',[PInt(0),PInt(0),PInt(0),PInt(0)])]))
         video_nodes.append(Node('Video',[PLong(vid),PStr(f'Video::{label}'),PStr('Clip')],[Node('Type',[PStr('Clip')]),Node('Properties70',children=[p_node('Path','KString','XRefUrl','',rel)]),Node('UseMipMap',[PInt(0)]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)])]))
     bone_models=[]; bone_attrs=[]
     for i,name in enumerate(bone_names):
-        r=skeleton[i]; tx,ty,tz=r['t']; rx,ry,rz=quat_to_euler_xyz_degrees(r['q']); child_ids=[j for j,p in parent.items() if p==i]
-        limb_len=max(0.5,dist(global_pos[child_ids[0]],global_pos[i])) if child_ids else 3.0
+        r=skeleton[i]; tx,ty,tz=r['t']; tx*=BDG_FBX_EXPORT_SCALE; ty*=BDG_FBX_EXPORT_SCALE; tz*=BDG_FBX_EXPORT_SCALE; rx,ry,rz=quat_to_euler_xyz_degrees(r['q']); child_ids=[j for j,p in parent.items() if p==i]
+        limb_len=max(0.5,dist(scaled_global_pos[child_ids[0]],scaled_global_pos[i])) if child_ids else 3.0*BDG_FBX_EXPORT_SCALE
         bone_models.append(Node('Model',[PLong(BONE_MODEL_BASE+i),PStr(f'Model::{name}'),PStr('LimbNode')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',float(tx),float(ty),float(tz)),p_node('Lcl Rotation','Lcl Rotation','','A',float(rx),float(ry),float(rz)),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('RotationOrder','enum','','',0),p_node('LimbLength','double','Number','H',float(limb_len)),p_node('Size','double','Number','',1.0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])]))
         bone_attrs.append(Node('NodeAttribute',[PLong(BONE_ATTR_BASE+i),PStr(f'NodeAttribute::{name}'),PStr('LimbNode')],[Node('TypeFlags',[PStr('Skeleton')]),Node('Properties70',children=[p_node('Size','double','Number','',1.0)])]))
     cluster_indices=collections.defaultdict(list); cluster_weights=collections.defaultdict(list)
@@ -882,9 +1037,9 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
     skin=Node('Deformer',[PLong(SKIN_ID),PStr(f'Deformer::{asset}_Skin'),PStr('Skin')],[Node('Version',[PInt(101)]),Node('Link_DeformAcuracy',[PDouble(50.0)])])
     clusters=[]
     for i in range(BONE_COUNT):
-        clusters.append(Node('Deformer',[PLong(CLUSTER_BASE+i),PStr(f'SubDeformer::Cluster_{bone_names[i]}'),PStr('Cluster')],[Node('Version',[PInt(100)]),Node('UserData',[PStr(''),PStr('')]),Node('Indexes',[AInt(cluster_indices.get(i,[]))]),Node('Weights',[ADouble(cluster_weights.get(i,[]))]),Node('Transform',[ADouble(identity())]),Node('TransformLink',[ADouble(fbx_matrix_from_col(col_global[i]))])]))
+        clusters.append(Node('Deformer',[PLong(CLUSTER_BASE+i),PStr(f'SubDeformer::Cluster_{bone_names[i]}'),PStr('Cluster')],[Node('Version',[PInt(100)]),Node('UserData',[PStr(''),PStr('')]),Node('Indexes',[AInt(cluster_indices.get(i,[]))]),Node('Weights',[ADouble(cluster_weights.get(i,[]))]),Node('Transform',[ADouble(identity())]),Node('TransformLink',[ADouble(fbx_matrix_from_col(scaled_col_global[i]))])]))
     pose_children=[Node('Type',[PStr('BindPose')]),Node('Version',[PInt(100)]),Node('NbPoseNodes',[PInt(BONE_COUNT+1)]),Node('PoseNode',children=[Node('Node',[PLong(MODEL_ID)]),Node('Matrix',[ADouble(identity())])])]
-    for i in range(BONE_COUNT): pose_children.append(Node('PoseNode',children=[Node('Node',[PLong(BONE_MODEL_BASE+i)]),Node('Matrix',[ADouble(fbx_matrix_from_col(col_global[i]))])]))
+    for i in range(BONE_COUNT): pose_children.append(Node('PoseNode',children=[Node('Node',[PLong(BONE_MODEL_BASE+i)]),Node('Matrix',[ADouble(fbx_matrix_from_col(scaled_col_global[i]))])]))
     pose=Node('Pose',[PLong(POSE_ID),PStr(f'Pose::{asset}_BindPose'),PStr('BindPose')],pose_children)
     animation_objects=[]; animation_connections=[]; anim_curve_count=anim_curve_node_count=anim_stack_count=anim_layer_count=0; anim_manifest=[]
     def p_time(name,value): return Node('P',[PStr(name),PStr('KTime'),PStr('Time'),PStr(''),PLong(int(value))])
@@ -892,13 +1047,11 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
         nonlocal anim_curve_count
         anim_curve_count+=1
         if len(times)==1:
-            # FBX importers often treat a single key as a point, not a full clip;
-            # duplicate the constant value at a tiny later time. The Action stack
-            # still has the full LocalStop duration.
             times=[times[0], times[0]+(1.0/60.0)]
             vals=[vals[0], vals[0]]
         n=len(vals)
         return Node('AnimationCurve',[PLong(cid),PStr(f'AnimCurve::{name}'),PStr('')],[Node('Default',[PDouble(0.0)]),Node('KeyVer',[PInt(4008)]),Node('KeyTime',[ALong([int(round(t*FBX_TICKS_PER_SECOND)) for t in times])]),Node('KeyValueFloat',[AFloat([float(v) for v in vals])]),Node('KeyAttrFlags',[AInt([24840])]),Node('KeyAttrDataFloat',[AFloat([0,0,0,0])]),Node('KeyAttrRefCount',[AInt([n])])])
+
     for ai,a in enumerate(animations):
         sid=ANIM_ID_BASE+ai*10000+1; lid=ANIM_ID_BASE+ai*10000+2
         animation_objects += [Node('AnimationStack',[PLong(sid),PStr(f'AnimStack::{a["name"]}'),PStr('')],[Node('Properties70',children=[p_time('LocalStart',0),p_time('LocalStop',int(round(a['duration']*FBX_TICKS_PER_SECOND))),p_time('ReferenceStart',0),p_time('ReferenceStop',int(round(a['duration']*FBX_TICKS_PER_SECOND)))])]), Node('AnimationLayer',[PLong(lid),PStr(f'AnimLayer::{a["name"]}_Layer'),PStr('')])]
@@ -906,21 +1059,8 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
         for ti,tr in enumerate(a['tracks']):
             bone=tr['bone']; bname=bone_names[bone]; times=[k[0] for k in tr['keys']]; quats=[k[1] for k in tr['keys']]
             if times and times[0]>1e-7: times=[0.0]+times; quats=[quats[0]]+quats
-            # v10: the game stores quaternion rotation keys, but FBX/Blender imports
-            # the curves as Euler channels. Sparse Euler curves do not reproduce
-            # quaternion slerp, especially on wings/tails/neck chains. Bake dense
-            # 60fps quaternion samples and unwrap Euler angles for visual accuracy.
             src_key_count=len(times)
             times,quats=sample_quat_keys(times,quats,a.get('duration',0.0),fps=60.0)
-            # v20: do not pretend there is one magic FBX rotation conversion that
-            # is already proven for every kaiju. The exact animation data is the
-            # byte-exact native BDG resource in animations_raw/animations_import.
-            # FBX Actions are preview-only. Default to native_abs because FBX
-            # animation curves are absolute local transform values, not additive
-            # Blender pose deltas; the v19 bind_delta default visibly twisted
-            # monsters such as Anguirus. Power users can test alternates with:
-            #   set BDG_ANIM_PREVIEW_MODE=root_stabilized
-            #   set BDG_ANIM_PREVIEW_MODE=bind_delta
             root_stabilized=False
             fbx_pose_delta_from_bind=False
             if ANIM_PREVIEW_MODE == 'root_stabilized' and bone == 0 and 0 in skeleton:
@@ -960,31 +1100,6 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
     return {'animation_manifest':anim_manifest,'weighted_bones':len([i for i in range(BONE_COUNT) if cluster_indices.get(i)]),'fbx':f'{asset}.fbx'}
 
 
-def write_debug_objs(asset,outdir,submesh_vertex_faces):
-    """Write simple per-submesh OBJ files from the exact decoded vertex streams.
-    These are not used for reimport; they are a sanity/debug export so users can
-    inspect whether the model scanner found the full body before opening FBX.
-    """
-    meshdir=outdir/'mesh_debug_obj'
-    meshdir.mkdir(parents=True,exist_ok=True)
-    written=[]
-    for si,item in enumerate(submesh_vertex_faces):
-        name=f'{asset}_submesh_{si}_{item["layout"]}.obj'
-        path=meshdir/name
-        with path.open('w',encoding='utf-8') as f:
-            f.write(f'# Debug OBJ for {asset} submesh {si}; same decoded positions as FBX export\n')
-            for x,y,z in item['vertices']:
-                f.write(f'v {x:.9g} {y:.9g} {z:.9g}\n')
-            for u,v in item['uvs']:
-                f.write(f'vt {u:.9g} {v:.9g}\n')
-            for nx,ny,nz in item['normals']:
-                f.write(f'vn {nx:.9g} {ny:.9g} {nz:.9g}\n')
-            for a,b,c in item['faces']:
-                # OBJ is 1-based; vertices/uvs/normals are aligned one-to-one here.
-                f.write(f'f {a+1}/{a+1}/{a+1} {b+1}/{b+1}/{b+1} {c+1}/{c+1}/{c+1}\n')
-        written.append('mesh_debug_obj/'+name)
-    return written
-
 def extract_one(base,shape,anim,pvms,root,force=False):
     asset=base.replace(' ','_')
     out=root/f'{base}-Kaiju-Extracted'
@@ -1003,19 +1118,16 @@ def extract_one(base,shape,anim,pvms,root,force=False):
     for i in range(bone_count): comp(i)
     global_pos={i:(col_global[i][0][3],col_global[i][1][3],col_global[i][2][3]) for i in range(bone_count)}
     submeshes,skipped=choose_meshes(D,bone_count)
-    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; poly_indices=[]; face_count=0; mesh_stats=[]; debug_submeshes=[]
+    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; poly_indices=[]; face_count=0; mesh_stats=[]
     for si,sm in enumerate(submeshes):
-        dbg={'layout':sm['layout'],'vertices':[],'uvs':[],'normals':[],'faces':[]}
         for face in sm['faces']:
-            ids=[]; dbg_ids=[]
+            ids=[]
             for idx in face:
                 off=sm['v_start']+idx*sm['v_stride']
                 pos,uv,nrm,wts=parse_vertex_by_layout(D,off,bone_count,sm['layout'])
                 p=tuple(map(float,pos)); t=tuple(map(float,uv)); nn=tuple(map(float,nrm))
                 ids.append(len(vertices)); vertices.append(p); uvs.append(t); normals.append(nn); vertex_weights.append(wts)
-                dbg_ids.append(len(dbg['vertices'])); dbg['vertices'].append(p); dbg['uvs'].append(t); dbg['normals'].append(nn)
-            poly_indices.extend([ids[0],ids[1],-ids[2]-1]); dbg['faces'].append(tuple(dbg_ids)); face_count+=1
-        debug_submeshes.append(dbg)
+            poly_indices.extend([ids[0],ids[1],-ids[2]-1]); face_count+=1
         sm_positions=[]
         for vi in range(sm['v_count']):
             off=sm['v_start']+vi*sm['v_stride']
@@ -1024,10 +1136,9 @@ def extract_one(base,shape,anim,pvms,root,force=False):
         bbox={'min':[min(p[i] for p in sm_positions) for i in range(3)],'max':[max(p[i] for p in sm_positions) for i in range(3)]}
         mesh_stats.append({'submesh':si,'layout':sm['layout'],'display_list_start':hex(sm['dl_start']),'display_list_end':hex(sm['dl_end']),'vertex_start':hex(sm['v_start']),'vertex_stride':sm['v_stride'],'vertex_count':sm['v_count'],'triangle_faces':len(sm['faces']),'validation_score':sm['validation_score'],'index_width':sm.get('index_width',6),'bounds':bbox})
     tex_manifest,tex_bindings=decode_textures(D,strings,out,asset)
-    animations,animation_resource_locations=decode_animations(anim,bone_count,bone_names,skeleton,base,out)
-    debug_objs=write_debug_objs(asset,out,debug_submeshes)
+    animations=[]; animation_resource_locations=[]
     fbxinfo=make_fbx(asset,out,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,animations)
-    manifest={'tool_version':'v20_exact_native_animation_raw_first_conservative_fbx_preview_2026_05_10','source_shapes':shape.name,'source_anim':anim.name if anim else None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'debug_obj_exports':debug_objs,'animation_decode_note':f'v20: exact animation handling is raw-native first. animations_raw/*.bin is byte-exact and animations_import/*.bin patches those resources back when same-size. FBX Actions are explicitly preview-only and use preview mode {ANIM_PREVIEW_MODE}; default native_abs writes decoded BDG absolute local rotations directly because v19 bind_delta visibly twisted monsters in Blender. Set BDG_ANIM_PREVIEW_MODE=root_stabilized or bind_delta only for comparison. v18: Export writes the exact animation resource table used by import, so native BINs can be patched by name/offset/size without guessing. v17/v14-v15: animation resources are discovered by validated BDG headers and names are preserved across reused-animation monsters. v11/v10: rotation tracks scan on 2-byte boundaries; short/static tracks and 60fps quaternion-slerp baking are retained for preview. Secondary translation/root/aux sections are preserved raw and must decode to reach fully editable animation round-trip.','animation_preview_mode':ANIM_PREVIEW_MODE,'import_scope':'Importer patches same-topology mesh streams and textures by default. Skeleton rest-pose writeback is opt-in with --with-skeleton to avoid Blender FBX axis conversion rotating monsters in-game.'}
+    manifest={'source_shapes':shape.name,'source_anim':None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'fbx_export_scale':BDG_FBX_EXPORT_SCALE,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'debug_obj_exports':[],'animation_preview_mode':'disabled_shapes_only','import_scope':'Importer patches same-topology mesh streams and textures by default. Skeleton rest-pose writeback is opt-in with --with-skeleton to avoid Blender FBX axis conversion rotating monsters in-game.'}
     manifest['bones']=[{'idx':i,'name':bone_names[i],'parent':parent[i],'local_translation':skeleton[i]['t'],'local_quaternion_xyzw':skeleton[i]['q'],'global_position':global_pos[i]} for i in range(bone_count)]
     def _sha256_file(path):
         h=hashlib.sha256()
@@ -1042,7 +1153,7 @@ def extract_one(base,shape,anim,pvms,root,force=False):
     if raw_dir.exists():
         for raw in sorted(raw_dir.iterdir()):
             if raw.is_file(): manifest['file_hashes'][f'animations_raw/{raw.name}']=_sha256_file(raw)
-    (out/'decode_manifest.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    (out/'import_log.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
     for p in pvms:
         try: shutil.copy2(p,out/p.name)
         except Exception: pass

@@ -57,9 +57,9 @@ def find_extract_folder(root: Path) -> Path:
     return candidates[0]
 
 def load_manifest(extracted: Path) -> dict:
-    m = extracted / 'decode_manifest.json'
+    m = extracted / 'import_log.json'
     if not m.exists():
-        raise SystemExit(f'Missing decode_manifest.json in {extracted}')
+        raise SystemExit(f'Missing import_log.json in {extracted}')
     return json.loads(m.read_text(encoding='utf-8'))
 
 # ----------------------------- Wii texture encoders -----------------------------
@@ -370,6 +370,14 @@ def extract_fbx_mesh(path: Path):
     vertices=[tuple(map(float,flat[i:i+3])) for i in range(0,len(flat),3)]
     pvi=[int(x) for x in pvi_node.props[0]]
     cp_seq=[(-x-1 if x < 0 else x) for x in pvi]
+    polygon_faces=[]; cur=[]
+    for raw_i, cp_i in zip(pvi, cp_seq):
+        cur.append(int(cp_i))
+        if raw_i < 0:
+            polygon_faces.append(cur)
+            cur=[]
+    if cur:
+        polygon_faces.append(cur)
     # normals
     normal_by_pv=None; normal_by_cp=None
     len_pv=len(cp_seq)
@@ -443,6 +451,7 @@ def extract_fbx_mesh(path: Path):
                                'rotation_euler_xyz_deg':tuple(map(float,r[:3])) if r and len(r)>=3 else None}
     return {
         'roots': roots, 'version': version, 'vertices': vertices, 'polygon_cp_sequence': cp_seq,
+        'polygon_faces': polygon_faces,
         'normal_by_pv': normal_by_pv, 'normal_by_cp': normal_by_cp,
         'uv_by_pv': uv_by_pv, 'uv_by_cp': uv_by_cp,
         'weights_by_cp': weights_by_cp, 'bone_models': bone_models,
@@ -502,6 +511,9 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
     cp_seq=fbx['polygon_cp_sequence']
     if len(cp_seq) != len(cp_map):
         report['mesh_patch']={'status':'skipped_topology_changed','fbx_polygon_vertices':len(cp_seq),'expected_polygon_vertices':len(cp_map)}; return
+    fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
+    if abs(fbx_export_scale) < 1e-8:
+        fbx_export_scale=1.0
     # aggregate per original source vertex
     accum=collections.defaultdict(lambda: {'pos':[0.0,0.0,0.0], 'norm':[0.0,0.0,0.0], 'uv':[0.0,0.0], 'n':0, 'weights':collections.defaultdict(float), 'wn':0})
     verts=fbx['vertices']
@@ -539,13 +551,9 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
         sm=submeshes[sm_i]
         stride=parse_int_maybe_hex(sm['vertex_stride'])
         off=parse_int_maybe_hex(sm['vertex_start']) + src_i*stride
-        # Map stride -> layout. Must match utils/bdg_to_fbx_extract_all and
-        # main._read_pos_uv_nrm. Without explicit blend52/blend60/skin48
-        # branches, those streams used to be patched as if they were skin64,
-        # writing UVs and weights into the wrong byte offsets and corrupting
-        # JetJaguar/Biollante/Gigan/SpaceGodzilla on save.
+        # Map stream stride to the matching packed vertex layout.
         layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
-        pos=(a['pos'][0]/n,a['pos'][1]/n,a['pos'][2]/n)
+        pos=(a['pos'][0]/n/fbx_export_scale,a['pos'][1]/n/fbx_export_scale,a['pos'][2]/n/fbx_export_scale)
         norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
         uv=(a['uv'][0]/n,a['uv'][1]/n) if any(abs(x)>1e-8 for x in a['uv']) else None
         struct.pack_into('>3f', shape, off, *pos)
@@ -608,7 +616,7 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
                     struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
                     weights_patched+=1
         patched += 1
-    report['mesh_patch']={'status':'patched','source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'fbx_version':fbx['version']}
+    report['mesh_patch']={'status':'patched','source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'fbx_version':fbx['version'],'fbx_export_scale':fbx_export_scale}
 
 def patch_skeleton_from_fbx(shape: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
     fbx_path=extracted / manifest.get('fbx','Godzilla2K.fbx')
@@ -621,6 +629,9 @@ def patch_skeleton_from_fbx(shape: bytearray, extracted: Path, manifest: dict, r
     records=parse_skeleton_records(bytes(shape))
     # Flexible name map: exact, space->underscore, trailing clean names.
     models=fbx['bone_models']
+    fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
+    if abs(fbx_export_scale) < 1e-8:
+        fbx_export_scale=1.0
     patched=0; missing=[]
     for idx,r in records.items():
         name=r['name']
@@ -637,9 +648,10 @@ def patch_skeleton_from_fbx(shape: bytearray, extracted: Path, manifest: dict, r
             q=euler_xyz_degrees_to_quat(*cand['rotation_euler_xyz_deg'])
             struct.pack_into('>4f', shape, off+16, *q)
         if cand.get('translation'):
-            struct.pack_into('>3f', shape, off+32, *cand['translation'])
+            tx,ty,tz=cand['translation']
+            struct.pack_into('>3f', shape, off+32, tx/fbx_export_scale, ty/fbx_export_scale, tz/fbx_export_scale)
         patched += 1
-    report['skeleton_patch']={'status':'patched' if patched else 'skipped_no_matching_bones','bones_patched':patched,'bones_missing_from_fbx':missing[:20],'missing_count':len(missing)}
+    report['skeleton_patch']={'status':'patched' if patched else 'skipped_no_matching_bones','bones_patched':patched,'bones_missing_from_fbx':missing[:20],'missing_count':len(missing),'fbx_export_scale':fbx_export_scale}
 
 def raw_anims_changed(extracted: Path, manifest: dict, name: str) -> bool:
     hashes=manifest.get('file_hashes') or {}
