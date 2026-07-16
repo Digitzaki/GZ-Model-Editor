@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-All-kaiju reimport wrapper.
-
-This now uses the real same-topology FBX mesh/rest-pose writeback path from
-fbx_to_bdg_import.py for every extracted folder whose manifest contains the
-needed stream offsets. Animations import through exact native same-size raw BIN swaps;
-Blender Action -> proprietary BDG animation encoding is intentionally not faked.
-"""
 from pathlib import Path
 import argparse, collections, json, shutil, sys, zipfile
 

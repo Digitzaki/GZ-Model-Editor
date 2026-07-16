@@ -2,7 +2,7 @@
 
 Originally developed by Digitzaki. Trimmed down to only what the viewer needs:
 parse a Pipeworks bundle, list its files, extract file bytes, and overwrite a
-file's bytes back into the bundle in place (same-size replacements only).
+file's bytes back into the bundle in place.
 """
 from __future__ import annotations
 

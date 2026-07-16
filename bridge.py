@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""Small FBX/BDG bridge for Blender workflows."""
 from __future__ import annotations
 
 import argparse

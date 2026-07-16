@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """GameCube Pipeworks CMG mesh exporter."""
 from __future__ import annotations
 

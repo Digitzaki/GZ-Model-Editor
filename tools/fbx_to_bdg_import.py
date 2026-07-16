@@ -1,22 +1,6 @@
-#!/usr/bin/env python3
-"""
-BDG/PVM reimporter for the current proven Godzilla2K BDG-to-FBX bridge.
-
-This version performs real binary writeback for the pieces that are understood:
-  * copies the original BDG/PVM files into <name>-Kaiju-Reimported/
-  * re-encodes changed PNG textures back to the Shapes.BDG texture data area
-    (CMPR/DXT1, RGB565, and I8, in Wii tiled order)
-  * imports same-topology FBX mesh edits back into the original vertex streams
-    (positions, normals, UVs, and skin weights where clusters are available)
-  * imports FBX rest-pose bone translation/rotation back into the skeleton records
-  * replaces animations_raw/*.bin only when the byte size is exactly unchanged
-
-It still does not synthesize proprietary BDG animation streams from Blender action
-curves. That requires a proven encoder for the primary/secondary animation layouts.
-"""
 from __future__ import annotations
 from pathlib import Path
-import argparse, collections, hashlib, json, math, os, shutil, struct, sys, zlib
+import argparse, collections, hashlib, json, math, os, shutil, struct, sys, tempfile, zlib
 from PIL import Image
 
 # ----------------------------- small utilities -----------------------------
@@ -318,15 +302,32 @@ def parse_skeleton_records(shape: bytes):
 CMD_QUADS=0x80; CMD_TRIS=0x90; CMD_TRI_STRIP=0x98; CMD_TRI_FAN=0xA0
 VALID={CMD_QUADS,CMD_TRIS,CMD_TRI_STRIP,CMD_TRI_FAN}
 
-def read_display_list(shape: bytes, start: int):
+def read_display_list(shape: bytes, start: int, index_width: int = 6):
     pos=start; faces=[]
-    while pos < len(shape)-3 and shape[pos] in VALID:
+    cmds=0
+    while pos < len(shape)-3:
+        if shape[pos] == 0x00 and cmds > 0:
+            pos += 1
+            continue
+        if shape[pos] not in VALID:
+            break
         op=shape[pos]; count=struct.unpack_from('>H', shape, pos+1)[0]; pos += 3
+        if count < 3 or count > 4096 or pos + index_width * count > len(shape):
+            break
         verts=[]
         for _ in range(count):
-            if pos+6 > len(shape): break
-            a,b,c=struct.unpack_from('>3H', shape, pos); pos += 6
+            if index_width == 6:
+                a,b,c=struct.unpack_from('>3H', shape, pos); pos += 6
+            elif index_width == 3:
+                a,b,c=shape[pos],shape[pos+1],shape[pos+2]; pos += 3
+            elif index_width == 4:
+                a,b,c=shape[pos],shape[pos+1],shape[pos+2]; pos += 4
+            elif index_width == 8:
+                a,b,c,_d=struct.unpack_from('>4H', shape, pos); pos += 8
+            else:
+                raise ValueError(f'unsupported display-list index width {index_width}')
             verts.append(a)
+        cmds += 1
         if op==CMD_QUADS:
             for i in range(0,len(verts)-3,4):
                 faces.append((verts[i],verts[i+1],verts[i+2])); faces.append((verts[i],verts[i+2],verts[i+3]))
@@ -348,7 +349,7 @@ def build_cp_to_source_map(shape: bytes, manifest: dict):
     cp=[]
     for sm_i,sm in enumerate(manifest['mesh_stats']):
         dl=parse_int_maybe_hex(sm['display_list_start'])
-        faces=read_display_list(shape, dl)
+        faces=read_display_list(shape, dl, int(sm.get('index_width', 6)))
         for f in faces:
             for idx in f:
                 cp.append((sm_i, idx))
@@ -491,13 +492,364 @@ def patch_textures(shape: bytearray, extracted: Path, manifest: dict, report: di
 def choose_top_weights(weight_map: dict, bone_name_to_id: dict, max_count: int):
     out=[]
     for name,wt in weight_map.items():
-        if name in bone_name_to_id and wt > 1e-7:
-            out.append((bone_name_to_id[name], float(wt)))
+        candidates = [str(name)]
+        if str(name).endswith('SubDeformer'):
+            candidates.append(str(name)[:-len('SubDeformer')])
+        if str(name).startswith('Cluster_'):
+            candidates.append(str(name)[len('Cluster_'):])
+        bone_id = None
+        for cand in candidates:
+            if cand in bone_name_to_id:
+                bone_id = bone_name_to_id[cand]
+                break
+            alt = cand.replace('_', ' ')
+            if alt in bone_name_to_id:
+                bone_id = bone_name_to_id[alt]
+                break
+        if bone_id is not None and wt > 1e-7:
+            out.append((bone_id, float(wt)))
     out.sort(key=lambda x: x[1], reverse=True)
     out=out[:max_count]
     s=sum(w for _,w in out)
     if s <= 1e-8: return []
     return [(b,w/s) for b,w in out]
+
+def _bundle_entries_from_bytes(data: bytes):
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.BDG') as f:
+            f.write(data)
+            tmp_name = f.name
+        from parser_core import PipeworksParser
+        parser = PipeworksParser(tmp_name)
+        entries = parser.parse()
+        return parser, entries
+    finally:
+        if tmp_name:
+            try: os.unlink(tmp_name)
+            except Exception: pass
+
+def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, cp_map: list[tuple[int, int]]) -> dict:
+    fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
+    if abs(fbx_export_scale) < 1e-8:
+        fbx_export_scale=1.0
+    accum=collections.defaultdict(lambda: {'pos':[0.0,0.0,0.0], 'norm':[0.0,0.0,0.0], 'uv':[0.0,0.0], 'n':0, 'weights':collections.defaultdict(float), 'wn':0})
+    verts=fbx['vertices']
+    cp_seq=fbx['polygon_cp_sequence']
+    for pv_i,(sm_i,src_i) in enumerate(cp_map):
+        if pv_i >= len(cp_seq):
+            raise ValueError(f'FBX polygon vertex stream ended early at {pv_i}; expected at least {len(cp_map)}')
+        cp_i=cp_seq[pv_i]
+        if cp_i < 0 or cp_i >= len(verts):
+            raise ValueError(f'invalid FBX polygon index {cp_i}')
+        key=(sm_i,src_i); a=accum[key]
+        p=verts[cp_i]
+        a['pos'][0]+=p[0]; a['pos'][1]+=p[1]; a['pos'][2]+=p[2]
+        if fbx['normal_by_pv'] and pv_i < len(fbx['normal_by_pv']): n=fbx['normal_by_pv'][pv_i]
+        elif fbx['normal_by_cp'] and cp_i < len(fbx['normal_by_cp']): n=fbx['normal_by_cp'][cp_i]
+        else: n=None
+        if n:
+            a['norm'][0]+=n[0]; a['norm'][1]+=n[1]; a['norm'][2]+=n[2]
+        if fbx['uv_by_pv'] and pv_i < len(fbx['uv_by_pv']): uv=fbx['uv_by_pv'][pv_i]
+        elif fbx['uv_by_cp'] and cp_i < len(fbx['uv_by_cp']): uv=fbx['uv_by_cp'][cp_i]
+        else: uv=None
+        if uv:
+            a['uv'][0]+=uv[0]; a['uv'][1]+=uv[1]
+        wmap=fbx['weights_by_cp'].get(cp_i)
+        if wmap:
+            for bn,wt in wmap.items(): a['weights'][bn]+=wt
+            a['wn'] += 1
+        a['n'] += 1
+    bones=manifest.get('bones',[])
+    bone_name_to_id={b['name']:int(b['idx']) for b in bones}
+    for b in bones:
+        bone_name_to_id.setdefault(str(b['name']).replace(' ','_'), int(b['idx']))
+    patched=0; weights_patched=0; reduced=0
+    submeshes=manifest['mesh_stats']
+    for (sm_i,src_i),a in accum.items():
+        n=max(1,a['n'])
+        sm=submeshes[sm_i]
+        stride=parse_int_maybe_hex(sm['vertex_stride'])
+        off=parse_int_maybe_hex(sm['vertex_start']) + src_i*stride
+        layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
+        pos=(a['pos'][0]/n/fbx_export_scale,a['pos'][1]/n/fbx_export_scale,a['pos'][2]/n/fbx_export_scale)
+        norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
+        uv=(a['uv'][0]/n,a['uv'][1]/n) if any(abs(x)>1e-8 for x in a['uv']) else None
+        struct.pack_into('>3f', shape, off, *pos)
+        if layout == 'skin64':
+            if uv: struct.pack_into('>2f', shape, off+20, float(uv[0]), float(1.0-uv[1]))
+            if norm: struct.pack_into('>3f', shape, off+28, *norm)
+            if a['wn']:
+                wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
+                top=choose_top_weights(wavg, bone_name_to_id, 2)
+                if top:
+                    if len(wavg)>2: reduced+=1
+                    if len(top)==1:
+                        b0=top[0][0]; b1=b0; w0=1.0
+                    else:
+                        b0,w0=top[0]; b1,w1=top[1]
+                    struct.pack_into('>f', shape, off+12, float(w0))
+                    struct.pack_into('>2H', shape, off+16, int(b0), int(b1))
+                    weights_patched+=1
+        elif layout in ('skin40','skin48'):
+            if norm: struct.pack_into('>3f', shape, off+20, *norm)
+            if uv: struct.pack_into('>2f', shape, off+32, float(uv[0]), float(1.0-uv[1]))
+            if a['wn']:
+                wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
+                top=choose_top_weights(wavg, bone_name_to_id, 2)
+                if top:
+                    if len(wavg)>2: reduced+=1
+                    if len(top)==1:
+                        b0=top[0][0]; b1=b0; w0=1.0
+                    else:
+                        b0,w0=top[0]; b1,w1=top[1]
+                    struct.pack_into('>f', shape, off+12, float(w0))
+                    struct.pack_into('>2H', shape, off+16, int(b0), int(b1))
+                    weights_patched+=1
+        elif layout in ('blend52','blend60'):
+            if norm: struct.pack_into('>3f', shape, off+32, *norm)
+            if uv: struct.pack_into('>2f', shape, off+44, float(uv[0]), float(1.0-uv[1]))
+            if a['wn']:
+                wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
+                top=choose_top_weights(wavg, bone_name_to_id, 4)
+                if top:
+                    if len(wavg)>4: reduced+=1
+                    while len(top)<4: top.append((top[-1][0],0.0))
+                    total=sum(w for _,w in top) or 1.0
+                    top=[(b,w/total) for b,w in top]
+                    struct.pack_into('>3f', shape, off+12, float(top[0][1]), float(top[1][1]), float(top[2][1]))
+                    struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
+                    weights_patched+=1
+        else:
+            if uv: struct.pack_into('>2f', shape, off+32, float(uv[0]), float(1.0-uv[1]))
+            if norm: struct.pack_into('>3f', shape, off+40, *norm)
+            if a['wn']:
+                wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
+                top=choose_top_weights(wavg, bone_name_to_id, 4)
+                if top:
+                    if len(wavg)>4: reduced+=1
+                    while len(top)<4: top.append((top[-1][0],0.0))
+                    total=sum(w for _,w in top) or 1.0
+                    top=[(b,w/total) for b,w in top]
+                    struct.pack_into('>3f', shape, off+12, float(top[0][1]), float(top[1][1]), float(top[2][1]))
+                    struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
+                    weights_patched+=1
+        patched += 1
+    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'fbx_export_scale':fbx_export_scale}
+
+def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest: dict, report: dict, cp_map: list[tuple[int, int]] | None = None) -> bool:
+    old_cp_count = int(manifest.get('control_points') or 0)
+    old_face_count = int(manifest.get('triangles') or 0)
+    faces = [tuple(int(v) for v in f) for f in (fbx.get('polygon_faces') or []) if len(f) == 3]
+    vertices = list(fbx.get('vertices') or [])
+    if old_cp_count <= 0 or old_face_count <= 0 or len(faces) <= old_face_count:
+        return False
+
+    new_faces = faces[old_face_count:]
+    if not new_faces or any(any(v < old_cp_count for v in tri) for tri in new_faces):
+        return False
+    if any(any(v >= len(vertices) for v in tri) for tri in new_faces):
+        return False
+
+    existing_patch = {}
+    if cp_map is not None:
+        try:
+            existing_patch = _patch_existing_mesh_vertices(shape, fbx, manifest, cp_map)
+        except Exception as exc:
+            report['mesh_patch'] = {'status': f'error: existing mesh patch before topology grow failed: {type(exc).__name__}: {exc}'}
+            return True
+
+    old_shape = bytes(shape)
+    try:
+        import bdg_to_fbx_extract_all as bdg
+        import topology_bdg_writer as topo
+        parser, entries = _bundle_entries_from_bytes(old_shape)
+        mesh_entries = [e for e in entries if e.get('file_type') == 17 and e.get('is_resource')]
+        main_entries = [e for e in entries if e.get('file_type') == 17 and not e.get('is_resource')]
+        if len(mesh_entries) != 1 or len(main_entries) != 1:
+            return False
+        submeshes, _skipped = bdg.choose_meshes(old_shape, int(manifest.get('bone_count') or 0))
+        endian = '>' if parser.is_big_endian else '<'
+        topo._find_mesh_descriptors(old_shape, main_entries[0], mesh_entries[0], submeshes, endian)
+    except Exception as exc:
+        report['mesh_patch'] = {'status': f'error: topology setup failed: {exc}'}
+        return True
+
+    cp_to_pv = {}
+    for pv_i, cp_i in enumerate(fbx.get('polygon_cp_sequence') or []):
+        cp_to_pv.setdefault(int(cp_i), pv_i)
+
+    def normal_for_cp(cp_i: int):
+        pv_i = cp_to_pv.get(cp_i)
+        if pv_i is not None and fbx.get('normal_by_pv') and pv_i < len(fbx['normal_by_pv']):
+            return fbx['normal_by_pv'][pv_i]
+        if fbx.get('normal_by_cp') and cp_i < len(fbx['normal_by_cp']):
+            return fbx['normal_by_cp'][cp_i]
+        return (0.0, 0.0, 1.0)
+
+    def uv_for_cp(cp_i: int):
+        pv_i = cp_to_pv.get(cp_i)
+        uv = None
+        if pv_i is not None and fbx.get('uv_by_pv') and pv_i < len(fbx['uv_by_pv']):
+            uv = fbx['uv_by_pv'][pv_i]
+        elif fbx.get('uv_by_cp') and cp_i < len(fbx['uv_by_cp']):
+            uv = fbx['uv_by_cp'][cp_i]
+        if uv is None:
+            return (0.0, 0.0)
+        return (float(uv[0]), float(1.0 - uv[1]))
+
+    fbx_export_scale = float(manifest.get('fbx_export_scale') or 1.0)
+    if abs(fbx_export_scale) < 1e-8:
+        fbx_export_scale = 1.0
+    payload_vertices = [
+        (float(p[0]) / fbx_export_scale, float(p[1]) / fbx_export_scale, float(p[2]) / fbx_export_scale)
+        for p in vertices
+    ]
+    payload_normals = [tuple(map(float, normal_for_cp(i))) for i in range(len(vertices))]
+    payload_uvs = [uv_for_cp(i) for i in range(len(vertices))]
+    bones = manifest.get('bones', [])
+    bone_name_to_id = {b['name']: int(b['idx']) for b in bones}
+    for b in bones:
+        bone_name_to_id.setdefault(str(b['name']).replace(' ', '_'), int(b['idx']))
+    payload_weights = [
+        choose_top_weights(fbx.get('weights_by_cp', {}).get(i, {}), bone_name_to_id, 4)
+        for i in range(len(vertices))
+    ]
+
+    vertex_src = []
+    tri_groups = []
+    source_items = []
+    cp_i = 0
+    for sm_i, sm in enumerate(submeshes):
+        display_records = []
+        try:
+            for cmd in topo._parse_dl_commands_with_records(
+                old_shape,
+                int(sm['dl_start']),
+                int(sm.get('dl_end', sm['v_start'])),
+                int(sm.get('index_width', 6)),
+            ):
+                for rec_face in cmd.get('faces') or []:
+                    for rec in rec_face:
+                        display_records.append({
+                            'raw_hex': bytes(rec.get('raw') or b'').hex(),
+                            'a': int(rec.get('a', 0)),
+                            'b': int(rec.get('b', rec.get('a', 0))),
+                            'c': int(rec.get('c', rec.get('a', 0))),
+                            'd': int(rec.get('d', rec.get('a', 0))),
+                        })
+        except Exception:
+            display_records = []
+        corner = 0
+        layout = str(sm['layout'])
+        stride = int(sm['v_stride'])
+        for face in sm.get('faces') or []:
+            for src_idx in face:
+                rec = display_records[corner] if corner < len(display_records) else None
+                src = (int(sm['v_start']), int(src_idx), layout, rec) if rec else (int(sm['v_start']), int(src_idx), layout)
+                vertex_src.append(src)
+                if cp_i < len(payload_vertices):
+                    source_items.append({
+                        'cp': cp_i,
+                        'sm_i': sm_i,
+                        'src': src,
+                        'pos': payload_vertices[cp_i],
+                        'uv': uv_for_cp(cp_i),
+                        'normal': normal_for_cp(cp_i),
+                    })
+                cp_i += 1
+                corner += 1
+            tri_groups.append(sm_i)
+    if len(vertex_src) != old_cp_count or len(tri_groups) != old_face_count:
+        return False
+
+    def dist2(a, b):
+        return ((float(a[0]) - float(b[0])) ** 2 +
+                (float(a[1]) - float(b[1])) ** 2 +
+                (float(a[2]) - float(b[2])) ** 2)
+
+    def nearest(candidates, pos, uv=None, normal=None):
+        best = None
+        best_d = float('inf')
+        for item in candidates:
+            d = dist2(item['pos'], pos) * 0.001
+            if uv is not None and item.get('uv') is not None:
+                du = float(item['uv'][0]) - float(uv[0])
+                dv = float(item['uv'][1]) - float(uv[1])
+                d += (du * du + dv * dv) * 10000.0
+            if normal is not None and item.get('normal') is not None:
+                dn = (
+                    (float(item['normal'][0]) - float(normal[0])) ** 2 +
+                    (float(item['normal'][1]) - float(normal[1])) ** 2 +
+                    (float(item['normal'][2]) - float(normal[2])) ** 2
+                )
+                d += dn
+            if d < best_d:
+                best = item
+                best_d = d
+        return best
+
+    new_cp_ids = sorted({v for tri in new_faces for v in tri})
+    group_votes = collections.Counter()
+    for cp in new_cp_ids:
+        item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+        if item:
+            group_votes[int(item['sm_i'])] += 1
+    if not group_votes:
+        return False
+    owner_group = group_votes.most_common(1)[0][0]
+    owner_candidates = [item for item in source_items if int(item['sm_i']) == owner_group] or source_items
+    for cp in range(old_cp_count, len(payload_vertices)):
+        item = nearest(owner_candidates, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+        if item is None:
+            return False
+        vertex_src.append((-1, cp, 'virtual', tuple(item['src'])))
+
+    payload = {
+        'vertices': payload_vertices,
+        'normals': payload_normals,
+        'uvs': payload_uvs,
+        'weights': payload_weights,
+        'triangles': faces,
+        'tri_groups': tri_groups + [owner_group] * len(new_faces),
+        'vertex_src': vertex_src,
+    }
+
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.BDG') as tmp:
+            tmp.write(old_shape)
+            tmp_name = tmp.name
+        topo.save_topology_payload_to_bdg(tmp_name, payload)
+        shape[:] = Path(tmp_name).read_bytes()
+    except Exception as exc:
+        report['mesh_patch'] = {
+            'status': f'error: topology grow failed: {type(exc).__name__}: {exc}',
+            'owner_template_submesh': owner_group,
+            'new_faces': len(new_faces),
+            'new_vertices': len(new_cp_ids),
+        }
+        return True
+    finally:
+        if tmp_name:
+            try: Path(tmp_name).unlink()
+            except Exception: pass
+
+    report['mesh_patch'] = {
+        'status': 'patched_added_topology',
+        'new_faces': len(new_faces),
+        'new_vertices': len(new_cp_ids),
+        'owner_template_submesh': owner_group,
+        'template_group_votes': dict(group_votes),
+        'existing_source_vertices_patched': existing_patch.get('source_vertices_patched', 0),
+        'existing_weights_patched': existing_patch.get('weights_patched', 0),
+        'existing_weights_reduced_to_source_limits': existing_patch.get('weights_reduced_to_source_limits', 0),
+        'new_weights_patched': sum(1 for cp in new_cp_ids if cp < len(payload_weights) and payload_weights[cp]),
+        'old_size': len(old_shape),
+        'new_size': len(shape),
+        'fbx_export_scale': fbx_export_scale,
+    }
+    return True
 
 def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
     fbx_path=extracted / manifest.get('fbx','Godzilla2K.fbx')
@@ -510,6 +862,8 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
     cp_map=build_cp_to_source_map(bytes(shape), manifest)
     cp_seq=fbx['polygon_cp_sequence']
     if len(cp_seq) != len(cp_map):
+        if patch_mesh_added_topology_editor_style(shape, fbx, manifest, report, cp_map):
+            return
         report['mesh_patch']={'status':'skipped_topology_changed','fbx_polygon_vertices':len(cp_seq),'expected_polygon_vertices':len(cp_map)}; return
     fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
     if abs(fbx_export_scale) < 1e-8:

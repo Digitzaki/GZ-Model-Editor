@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Tkinter front end for the BDG Blender bridge."""
+"""Tkinter front end for the BDG Blender Converter."""
 from __future__ import annotations
 
 import queue
@@ -12,8 +11,18 @@ from tkinter import filedialog, messagebox, ttk
 
 import bridge
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
 
-class BridgeGui(tk.Tk):
+    BaseTk = TkinterDnD.Tk
+    HAS_DND = True
+except Exception:
+    DND_FILES = None
+    BaseTk = tk.Tk
+    HAS_DND = False
+
+
+class BridgeGui(BaseTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GZ Blender Converter")
@@ -40,9 +49,11 @@ class BridgeGui(tk.Tk):
         tabs.add(self._export_tab(tabs), text="Export")
         tabs.add(self._import_tab(tabs), text="Import")
 
-    def _row(self, parent: ttk.Frame, row: int, label: str, var: tk.StringVar, browse) -> None:
+    def _row(self, parent: ttk.Frame, row: int, label: str, var: tk.StringVar, browse, drop_kind: str = "file") -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+        self._enable_drop(entry, var, drop_kind)
         ttk.Button(parent, text="Browse", command=browse).grid(row=row, column=2, sticky="ew", pady=3)
 
     def _export_tab(self, tabs: ttk.Notebook) -> ttk.Frame:
@@ -58,7 +69,7 @@ class BridgeGui(tk.Tk):
                 [("Kaiju model files", "*.BDG *.bdg *.CMG *.cmg"), ("All files", "*.*")],
             ),
         )
-        self._row(frame, 1, "Output folder", self.export_vars["out"], lambda: self._pick_folder(self.export_vars["out"]))
+        self._row(frame, 1, "Output folder", self.export_vars["out"], lambda: self._pick_folder(self.export_vars["out"]), "folder")
         ttk.Button(frame, text="Export to FBX", command=self._run_export).grid(row=2, column=1, sticky="e", pady=(8, 2))
         return frame
 
@@ -67,9 +78,26 @@ class BridgeGui(tk.Tk):
         frame.columnconfigure(1, weight=1)
         self._row(frame, 0, "Edited FBX", self.import_vars["fbx"], lambda: self._pick_file(self.import_vars["fbx"], [("FBX files", "*.fbx"), ("All files", "*.*")]))
         self._row(frame, 1, "Original file", self.import_vars["original"], lambda: self._pick_file(self.import_vars["original"], [("Kaiju model files", "*.BDG *.bdg *.CMG *.cmg *.ZIP *.zip"), ("All files", "*.*")]))
-        self._row(frame, 2, "Output folder", self.import_vars["out"], lambda: self._pick_folder(self.import_vars["out"]))
+        self._row(frame, 2, "Output folder", self.import_vars["out"], lambda: self._pick_folder(self.import_vars["out"]), "folder")
         ttk.Button(frame, text="Import from FBX", command=self._run_import).grid(row=3, column=1, sticky="e", pady=10)
         return frame
+
+    def _enable_drop(self, entry: ttk.Entry, var: tk.StringVar, drop_kind: str) -> None:
+        if not HAS_DND or DND_FILES is None:
+            return
+
+        entry.drop_target_register(DND_FILES)
+        entry.dnd_bind("<<Drop>>", lambda event: self._handle_drop(event, var, drop_kind))
+
+    def _handle_drop(self, event, var: tk.StringVar, drop_kind: str) -> str:
+        paths = self.tk.splitlist(event.data)
+        if not paths:
+            return "break"
+        path = Path(paths[0])
+        if drop_kind == "folder" and path.is_file():
+            path = path.parent
+        var.set(str(path))
+        return "break"
 
     def _pick_file(self, var: tk.StringVar, filetypes) -> None:
         path = filedialog.askopenfilename(filetypes=filetypes)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Patch same-topology GameCube CMG mesh positions from an edited FBX."""
 from __future__ import annotations
 

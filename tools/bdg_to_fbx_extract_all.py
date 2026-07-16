@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from pathlib import Path
 import argparse, collections, hashlib, io, json, math, os, re, shutil, struct, sys, zipfile
 from PIL import Image
