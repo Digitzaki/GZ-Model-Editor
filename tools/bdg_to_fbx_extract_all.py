@@ -753,6 +753,81 @@ def sample_quat_keys(times,quats,duration,fps=60.0):
         else: out_q.append(q_slerp(q0,q1,(t-t0)/(t1-t0)))
     return sample_times,out_q
 
+def _triangle_uv_span(tri_uvs):
+    if len(tri_uvs) != 3:
+        return 0.0
+    best = 0.0
+    for a, b in ((0, 1), (1, 2), (2, 0)):
+        du = float(tri_uvs[a][0]) - float(tri_uvs[b][0])
+        dv = float(tri_uvs[a][1]) - float(tri_uvs[b][1])
+        best = max(best, math.sqrt(du * du + dv * dv))
+    return best
+
+def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights):
+    groups = collections.defaultdict(list)
+    face_count = len(vertices) // 3
+    for fi in range(face_count):
+        start = fi * 3
+        key = tuple(sorted(
+            (round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4))
+            for p in vertices[start:start + 3]
+        ))
+        groups[key].append((fi, _triangle_uv_span(uvs[start:start + 3])))
+
+    far_duplicate_extra = 0
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        face_ids = [fi for fi, _span in rows]
+        if max(face_ids) - min(face_ids) > 64:
+            far_duplicate_extra += len(rows) - 1
+    if far_duplicate_extra <= 0 or far_duplicate_extra > 64:
+        poly_indices = []
+        for fi in range(face_count):
+            base = fi * 3
+            poly_indices.extend([base, base + 1, -base - 3])
+        return vertices, normals, uvs, vertex_weights, poly_indices, 0
+
+    drop = set()
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        spans = [span for _fi, span in rows]
+        face_ids = [fi for fi, _span in rows]
+        if max(face_ids) - min(face_ids) <= 64:
+            continue
+        if max(spans) - min(spans) > 0.02:
+            keep = min(rows, key=lambda row: row[1])[0]
+        else:
+            keep = max(rows, key=lambda row: row[0])[0]
+        for fi, _span in rows:
+            if fi != keep:
+                drop.add(fi)
+
+    if not drop:
+        poly_indices = []
+        for fi in range(face_count):
+            base = fi * 3
+            poly_indices.extend([base, base + 1, -base - 3])
+        return vertices, normals, uvs, vertex_weights, poly_indices, 0
+
+    out_vertices = []
+    out_normals = []
+    out_uvs = []
+    out_weights = []
+    out_poly = []
+    for fi in range(face_count):
+        if fi in drop:
+            continue
+        base = len(out_vertices)
+        start = fi * 3
+        out_vertices.extend(vertices[start:start + 3])
+        out_normals.extend(normals[start:start + 3])
+        out_uvs.extend(uvs[start:start + 3])
+        out_weights.extend(vertex_weights[start:start + 3])
+        out_poly.extend([base, base + 1, -base - 3])
+    return out_vertices, out_normals, out_uvs, out_weights, out_poly, len(drop)
+
 
 
 def q_conjugate(q):
@@ -1117,7 +1192,7 @@ def extract_one(base,shape,anim,pvms,root,force=False):
     for i in range(bone_count): comp(i)
     global_pos={i:(col_global[i][0][3],col_global[i][1][3],col_global[i][2][3]) for i in range(bone_count)}
     submeshes,skipped=choose_meshes(D,bone_count)
-    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; poly_indices=[]; face_count=0; mesh_stats=[]
+    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; face_count=0; mesh_stats=[]
     for si,sm in enumerate(submeshes):
         for face in sm['faces']:
             ids=[]
@@ -1126,7 +1201,7 @@ def extract_one(base,shape,anim,pvms,root,force=False):
                 pos,uv,nrm,wts=parse_vertex_by_layout(D,off,bone_count,sm['layout'])
                 p=tuple(map(float,pos)); t=tuple(map(float,uv)); nn=tuple(map(float,nrm))
                 ids.append(len(vertices)); vertices.append(p); uvs.append(t); normals.append(nn); vertex_weights.append(wts)
-            poly_indices.extend([ids[0],ids[1],-ids[2]-1]); face_count+=1
+            face_count+=1
         sm_positions=[]
         for vi in range(sm['v_count']):
             off=sm['v_start']+vi*sm['v_stride']
@@ -1136,8 +1211,10 @@ def extract_one(base,shape,anim,pvms,root,force=False):
         mesh_stats.append({'submesh':si,'layout':sm['layout'],'display_list_start':hex(sm['dl_start']),'display_list_end':hex(sm['dl_end']),'vertex_start':hex(sm['v_start']),'vertex_stride':sm['v_stride'],'vertex_count':sm['v_count'],'triangle_faces':len(sm['faces']),'validation_score':sm['validation_score'],'index_width':sm.get('index_width',6),'bounds':bbox})
     tex_manifest,tex_bindings=decode_textures(D,strings,out,asset)
     animations=[]; animation_resource_locations=[]
+    vertices,normals,uvs,vertex_weights,poly_indices,duplicate_seam_faces_skipped = _filter_duplicate_seam_faces(vertices,normals,uvs,vertex_weights)
+    face_count = len(poly_indices) // 3
     fbxinfo=make_fbx(asset,out,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,animations)
-    manifest={'source_shapes':shape.name,'source_anim':None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'fbx_export_scale':BDG_FBX_EXPORT_SCALE,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'debug_obj_exports':[],'animation_preview_mode':'disabled_shapes_only','import_scope':'Importer patches same-topology mesh streams and textures by default. Skeleton rest-pose writeback is opt-in with --with-skeleton to avoid Blender FBX axis conversion rotating monsters in-game.'}
+    manifest={'source_shapes':shape.name,'source_anim':None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'fbx_export_scale':BDG_FBX_EXPORT_SCALE,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'duplicate_seam_faces_skipped':duplicate_seam_faces_skipped,'debug_obj_exports':[],'animation_preview_mode':'disabled_shapes_only','import_scope':'Importer patches same-topology mesh streams and textures by default. Skeleton rest-pose writeback is opt-in with --with-skeleton to avoid Blender FBX axis conversion rotating monsters in-game.'}
     manifest['bones']=[{'idx':i,'name':bone_names[i],'parent':parent[i],'local_translation':skeleton[i]['t'],'local_quaternion_xyzw':skeleton[i]['q'],'global_position':global_pos[i]} for i in range(bone_count)]
     def _sha256_file(path):
         h=hashlib.sha256()

@@ -585,6 +585,15 @@ def _native_stored_uv(shape: bytes | bytearray, manifest: dict, sm_i: int, src_i
     except Exception:
         return None
 
+def _native_stored_pos(shape: bytes | bytearray, manifest: dict, sm_i: int, src_i: int):
+    try:
+        sm = manifest['mesh_stats'][int(sm_i)]
+        stride = parse_int_maybe_hex(sm['vertex_stride'])
+        off = parse_int_maybe_hex(sm['vertex_start']) + int(src_i) * stride
+        return struct.unpack_from('>3f', shape, off)
+    except Exception:
+        return None
+
 def _closest_uv_key(counts, native_uv):
     if not counts or native_uv is None:
         return None
@@ -626,6 +635,43 @@ def _uv_from_accum(a: dict, n: int, layout: str | None = None, native_uv=None):
             return (float(key[0]), float(key[1])), False
     return (a['uv'][0] / n, a['uv'][1] / n), False
 
+def _pos_from_accum(a: dict, n: int, fbx_export_scale: float, native_pos=None):
+    counts = a.get('pos_values') or {}
+    if len(counts) >= 2:
+        spread = max(
+            float(a.get('pos_max_x', 0.0)) - float(a.get('pos_min_x', 0.0)),
+            float(a.get('pos_max_y', 0.0)) - float(a.get('pos_min_y', 0.0)),
+            float(a.get('pos_max_z', 0.0)) - float(a.get('pos_min_z', 0.0)),
+        ) / fbx_export_scale
+        if spread > 2.0:
+            key = max(counts, key=lambda k: (counts[k], k))
+            return (
+                float(key[0]) / fbx_export_scale,
+                float(key[1]) / fbx_export_scale,
+                float(key[2]) / fbx_export_scale,
+            ), True
+    return (
+        a['pos'][0] / n / fbx_export_scale,
+        a['pos'][1] / n / fbx_export_scale,
+        a['pos'][2] / n / fbx_export_scale,
+    ), False
+
+def _add_pos_to_accum(a: dict, p):
+    x = float(p[0])
+    y = float(p[1])
+    z = float(p[2])
+    a['pos'][0] += x
+    a['pos'][1] += y
+    a['pos'][2] += z
+    a['pos_min_x'] = min(float(a.get('pos_min_x', x)), x)
+    a['pos_max_x'] = max(float(a.get('pos_max_x', x)), x)
+    a['pos_min_y'] = min(float(a.get('pos_min_y', y)), y)
+    a['pos_max_y'] = max(float(a.get('pos_max_y', y)), y)
+    a['pos_min_z'] = min(float(a.get('pos_min_z', z)), z)
+    a['pos_max_z'] = max(float(a.get('pos_max_z', z)), z)
+    counts = a.setdefault('pos_values', collections.Counter())
+    counts[(round(x, 5), round(y, 5), round(z, 5))] += 1
+
 def _add_uv_to_accum(a: dict, uv):
     if not uv:
         return
@@ -648,6 +694,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
     accum=collections.defaultdict(lambda: {'pos':[0.0,0.0,0.0], 'norm':[0.0,0.0,0.0], 'uv':[0.0,0.0], 'uv_samples':[], 'n':0, 'weights':collections.defaultdict(float), 'wn':0})
     verts=fbx['vertices']
     cp_seq=fbx['polygon_cp_sequence']
+    skipped_misaligned = 0
     for pv_i,(sm_i,src_i) in enumerate(cp_map):
         if pv_i >= len(cp_seq):
             raise ValueError(f'FBX polygon vertex stream ended early at {pv_i}; expected at least {len(cp_map)}')
@@ -656,7 +703,14 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
             raise ValueError(f'invalid FBX polygon index {cp_i}')
         key=(sm_i,src_i); a=accum[key]
         p=verts[cp_i]
-        a['pos'][0]+=p[0]; a['pos'][1]+=p[1]; a['pos'][2]+=p[2]
+        native_pos = _native_stored_pos(shape, manifest, sm_i, src_i)
+        if native_pos is not None:
+            scaled_p = (float(p[0]) / fbx_export_scale, float(p[1]) / fbx_export_scale, float(p[2]) / fbx_export_scale)
+            dist = math.dist(native_pos, scaled_p)
+            if dist > 250.0:
+                skipped_misaligned += 1
+                continue
+        _add_pos_to_accum(a, p)
         if fbx['normal_by_pv'] and pv_i < len(fbx['normal_by_pv']): n=fbx['normal_by_pv'][pv_i]
         elif fbx['normal_by_cp'] and cp_i < len(fbx['normal_by_cp']): n=fbx['normal_by_cp'][cp_i]
         else: n=None
@@ -677,7 +731,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
     bone_name_to_id={b['name']:int(b['idx']) for b in bones}
     for b in bones:
         bone_name_to_id.setdefault(str(b['name']).replace(' ','_'), int(b['idx']))
-    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0
+    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0; position_conflicts_preserved=0
     submeshes=manifest['mesh_stats']
     for (sm_i,src_i),a in accum.items():
         n=max(1,a['n'])
@@ -685,7 +739,10 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         stride=parse_int_maybe_hex(sm['vertex_stride'])
         off=parse_int_maybe_hex(sm['vertex_start']) + src_i*stride
         layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
-        pos=(a['pos'][0]/n/fbx_export_scale,a['pos'][1]/n/fbx_export_scale,a['pos'][2]/n/fbx_export_scale)
+        native_pos = _native_stored_pos(shape, manifest, sm_i, src_i)
+        pos, pos_conflict = _pos_from_accum(a, n, fbx_export_scale, native_pos)
+        if pos_conflict:
+            position_conflicts_preserved += 1
         norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
         stored_native_uv = _native_stored_uv(shape, manifest, sm_i, src_i)
         native_uv = (stored_native_uv[0], 1.0 - stored_native_uv[1]) if stored_native_uv is not None else None
@@ -752,7 +809,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
                     struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
                     weights_patched+=1
         patched += 1
-    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'fbx_export_scale':fbx_export_scale}
+    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'position_conflicts_preserved':position_conflicts_preserved,'misaligned_polygon_corners_skipped':skipped_misaligned,'fbx_export_scale':fbx_export_scale}
 
 def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest: dict, report: dict, cp_map: list[tuple[int, int]] | None = None) -> bool:
     old_cp_count = int(manifest.get('control_points') or 0)
@@ -881,6 +938,19 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
     if len(vertex_src) != old_cp_count or len(tri_groups) != old_face_count:
         return False
 
+    for cp_i in range(len(payload_vertices), old_cp_count):
+        if cp_i < len(source_items):
+            item = source_items[cp_i]
+            payload_vertices.append(tuple(item.get('pos') or (0.0, 0.0, 0.0)))
+            payload_normals.append(tuple(item.get('normal') or (0.0, 0.0, 1.0)))
+            payload_uvs.append(tuple(item.get('uv') or (0.0, 0.0)))
+            payload_weights.append([])
+        else:
+            payload_vertices.append((0.0, 0.0, 0.0))
+            payload_normals.append((0.0, 0.0, 1.0))
+            payload_uvs.append((0.0, 0.0))
+            payload_weights.append([])
+
     def dist2(a, b):
         return ((float(a[0]) - float(b[0])) ** 2 +
                 (float(a[1]) - float(b[1])) ** 2 +
@@ -945,6 +1015,46 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
             return tuple(map(float, fbx['normal_by_cp'][cp_i]))
         return payload_normals[cp_i] if cp_i < len(payload_normals) else (0.0, 0.0, 1.0)
 
+    def corner_pos_for_face(face_i: int, corner_i: int, cp_i: int):
+        pv_i = face_i * 3 + corner_i
+        src_cp = None
+        if fbx.get('polygon_cp_sequence') and pv_i < len(fbx['polygon_cp_sequence']):
+            src_cp = int(fbx['polygon_cp_sequence'][pv_i])
+        elif cp_i < len(vertices):
+            src_cp = cp_i
+        if src_cp is not None and 0 <= src_cp < len(vertices):
+            p = vertices[src_cp]
+            return (
+                float(p[0]) / fbx_export_scale,
+                float(p[1]) / fbx_export_scale,
+                float(p[2]) / fbx_export_scale,
+            )
+        return payload_vertices[cp_i] if cp_i < len(payload_vertices) else (0.0, 0.0, 0.0)
+
+    def preserve_original_face(face_i: int):
+        try:
+            original_key = []
+            for original_cp in faces[face_i]:
+                real_cp = original_cp
+                if not (0 <= real_cp < len(cp_map)):
+                    src = vertex_src[real_cp] if 0 <= real_cp < len(vertex_src) else None
+                    if isinstance(src, tuple) and len(src) >= 4 and src[2] == 'virtual':
+                        tmpl = src[3]
+                        _sm, _src = int(tmpl[0]), int(tmpl[1])
+                    else:
+                        original_key = []
+                        break
+                else:
+                    _sm, _src = cp_map[real_cp]
+                if int(_sm) != owner_group:
+                    original_key = []
+                    break
+                original_key.append(int(_src))
+            if len(original_key) == 3 and len(set(original_key)) == 3:
+                preserve_original_face_keys[int(owner_group)].append(tuple(sorted(original_key)))
+        except Exception:
+            pass
+
     if can_split_old_face_uvs:
         for face_i in range(old_face_count):
             for corner_i, cp_i in enumerate(faces[face_i]):
@@ -989,18 +1099,7 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
             if key == keep_key:
                 continue
             for face_i, corner_i, cp_i, _uv in group_uses:
-                try:
-                    original_key = []
-                    for original_cp in faces[face_i]:
-                        _sm, _src = cp_map[original_cp]
-                        if int(_sm) != owner_group:
-                            original_key = []
-                            break
-                        original_key.append(int(_src))
-                    if len(original_key) == 3 and len(set(original_key)) == 3:
-                        preserve_original_face_keys[int(owner_group)].append(tuple(sorted(original_key)))
-                except Exception:
-                    pass
+                preserve_original_face(face_i)
                 new_cp = len(payload_vertices)
                 payload_vertices.append(payload_vertices[cp_i])
                 payload_normals.append(corner_normal_for_face(face_i, corner_i, cp_i))
@@ -1010,6 +1109,65 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
                 faces[face_i][corner_i] = new_cp
                 split_uv_vertices += 1
                 split_uv_faces.add(face_i)
+
+    split_position_vertices = 0
+    split_position_faces = set()
+    by_pos_source = collections.defaultdict(list)
+    can_split_old_face_positions = existing_patch.get('position_conflicts_preserved', 0) >= 10
+    if can_split_old_face_uvs and can_split_old_face_positions:
+        for face_i in range(old_face_count):
+            for corner_i, cp_i in enumerate(faces[face_i]):
+                if not (0 <= cp_i < len(vertex_src)):
+                    continue
+                src = vertex_src[cp_i]
+                try:
+                    if isinstance(src, tuple) and len(src) >= 4 and src[2] == 'virtual':
+                        tmpl = src[3]
+                        sm_i, src_i, layout = int(tmpl[0]), int(tmpl[1]), str(tmpl[2])
+                    else:
+                        sm_i, src_i = cp_map[cp_i]
+                        layout = str(src[2])
+                except Exception:
+                    continue
+                if sm_i != owner_group:
+                    continue
+                pos = corner_pos_for_face(face_i, corner_i, cp_i)
+                by_pos_source[(sm_i, src_i, layout)].append((face_i, corner_i, cp_i, pos))
+
+    for src, uses in by_pos_source.items():
+        if len(uses) < 2:
+            continue
+        xs = [float(u[3][0]) for u in uses]
+        ys = [float(u[3][1]) for u in uses]
+        zs = [float(u[3][2]) for u in uses]
+        pos_spread = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+        if pos_spread <= 2.0:
+            continue
+        groups = collections.defaultdict(list)
+        for use in uses:
+            pos = use[3]
+            groups[(round(float(pos[0]), 5), round(float(pos[1]), 5), round(float(pos[2]), 5))].append(use)
+        if len(groups) < 2:
+            continue
+        keep_key = max(groups, key=lambda k: (len(groups[k]), k))
+        for key, group_uses in groups.items():
+            if key == keep_key:
+                continue
+            for face_i, corner_i, cp_i, pos in group_uses:
+                preserve_original_face(face_i)
+                current_cp = faces[face_i][corner_i]
+                new_cp = len(payload_vertices)
+                payload_vertices.append(pos)
+                payload_normals.append(corner_normal_for_face(face_i, corner_i, current_cp))
+                _uv = corner_uv_for_face(face_i, corner_i, current_cp)
+                if _uv is None and current_cp < len(payload_uvs):
+                    _uv = payload_uvs[current_cp]
+                payload_uvs.append(_uv if _uv is not None else (0.0, 0.0))
+                payload_weights.append(payload_weights[current_cp] if current_cp < len(payload_weights) else [])
+                vertex_src.append((-1, new_cp, 'virtual', tuple(vertex_src[current_cp])))
+                faces[face_i][corner_i] = new_cp
+                split_position_vertices += 1
+                split_position_faces.add(face_i)
 
     owner_candidates = [item for item in source_items if int(item['sm_i']) == owner_group] or source_items
     appended_virtual_vertices = 0
@@ -1087,8 +1245,12 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
         'existing_weights_patched': existing_patch.get('weights_patched', 0),
         'existing_weights_reduced_to_source_limits': existing_patch.get('weights_reduced_to_source_limits', 0),
         'existing_uv_conflicts_preserved': existing_patch.get('uv_conflicts_preserved', 0),
+        'existing_position_conflicts_preserved': existing_patch.get('position_conflicts_preserved', 0),
+        'misaligned_polygon_corners_skipped': existing_patch.get('misaligned_polygon_corners_skipped', 0),
         'split_uv_vertices': split_uv_vertices,
         'split_uv_faces': len(split_uv_faces),
+        'split_position_vertices': split_position_vertices,
+        'split_position_faces': len(split_position_faces),
         'new_weights_patched': sum(1 for cp in new_cp_ids if cp < len(payload_weights) and payload_weights[cp]),
         'old_size': len(old_shape),
         'new_size': len(shape),
