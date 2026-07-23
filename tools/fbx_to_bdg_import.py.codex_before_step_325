@@ -529,123 +529,11 @@ def _bundle_entries_from_bytes(data: bytes):
             try: os.unlink(tmp_name)
             except Exception: pass
 
-def _bdg_vertex_uv(shape: bytes | bytearray, off: int, layout: str):
-    try:
-        if layout == 'skin64':
-            u, v = struct.unpack_from('>2f', shape, off + 20)
-        elif layout in ('skin40', 'skin48'):
-            u, v = struct.unpack_from('>2f', shape, off + 32)
-        elif layout in ('blend52', 'blend60'):
-            u, v = struct.unpack_from('>2f', shape, off + 44)
-        else:
-            u, v = struct.unpack_from('>2f', shape, off + 32)
-    except Exception:
-        return None
-    if not all(math.isfinite(float(x)) for x in (u, v)):
-        return None
-    return (float(u), float(1.0 - v))
-
-def _uv_dist2(a, b):
-    return (float(a[0]) - float(b[0])) ** 2 + (float(a[1]) - float(b[1])) ** 2
-
-def _choose_seam_safe_uv(samples, original_uv=None):
-    samples = [tuple(map(float, uv)) for uv in samples or [] if uv is not None]
-    if not samples:
-        return None
-    if len(samples) == 1:
-        return samples[0]
-    spread = 0.0
-    for i, uv_a in enumerate(samples):
-        for uv_b in samples[i + 1:]:
-            spread = max(spread, _uv_dist2(uv_a, uv_b))
-    if spread > 0.035:
-        if original_uv is not None:
-            return min(samples, key=lambda uv: _uv_dist2(uv, original_uv))
-        counts = collections.Counter((round(uv[0], 5), round(uv[1], 5)) for uv in samples)
-        uv, _count = counts.most_common(1)[0]
-        return (float(uv[0]), float(uv[1]))
-    return (
-        sum(float(uv[0]) for uv in samples) / len(samples),
-        sum(float(uv[1]) for uv in samples) / len(samples),
-    )
-
-def _native_stored_uv(shape: bytes | bytearray, manifest: dict, sm_i: int, src_i: int):
-    try:
-        sm = manifest['mesh_stats'][int(sm_i)]
-        stride = parse_int_maybe_hex(sm['vertex_stride'])
-        off = parse_int_maybe_hex(sm['vertex_start']) + int(src_i) * stride
-        layout = {64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride, 'skin64')
-        if layout == 'skin64':
-            return struct.unpack_from('>2f', shape, off + 20)
-        if layout in ('skin40', 'skin48'):
-            return struct.unpack_from('>2f', shape, off + 32)
-        if layout in ('blend52', 'blend60'):
-            return struct.unpack_from('>2f', shape, off + 44)
-        return struct.unpack_from('>2f', shape, off + 32)
-    except Exception:
-        return None
-
-def _closest_uv_key(counts, native_uv):
-    if not counts or native_uv is None:
-        return None
-    return min(
-        counts,
-        key=lambda k: (
-            (float(k[0]) - float(native_uv[0])) ** 2 +
-            (float(k[1]) - float(native_uv[1])) ** 2,
-            -int(counts[k]),
-            k,
-        ),
-    )
-
-def _uv_from_accum(a: dict, n: int, layout: str | None = None, native_uv=None):
-    if not any(abs(x) > 1e-8 for x in a['uv']):
-        return None, False
-    if a.get('uv_count', 0) > 1:
-        counts = a.get('uv_values') or {}
-        spread = max(
-            float(a.get('uv_max_u', 0.0)) - float(a.get('uv_min_u', 0.0)),
-            float(a.get('uv_max_v', 0.0)) - float(a.get('uv_min_v', 0.0)),
-        )
-        if spread > 0.01:
-            key = _closest_uv_key(counts, native_uv)
-            if key is not None:
-                return (float(key[0]), float(key[1])), False
-            if layout == 'blend76' and len(counts) >= 2:
-                key = min(counts, key=lambda k: (counts[k], k))
-                return (float(key[0]), float(key[1])), False
-            if layout in ('skin64', 'skin48', 'skin40') and len(counts) >= 2:
-                key = max(counts, key=lambda k: (counts[k], k))
-                return (float(key[0]), float(key[1])), False
-            return None, True
-        if counts:
-            key = _closest_uv_key(counts, native_uv)
-            if key is not None:
-                return (float(key[0]), float(key[1])), False
-            key = max(counts, key=lambda k: (counts[k], k))
-            return (float(key[0]), float(key[1])), False
-    return (a['uv'][0] / n, a['uv'][1] / n), False
-
-def _add_uv_to_accum(a: dict, uv):
-    if not uv:
-        return
-    u = float(uv[0])
-    v = float(uv[1])
-    a['uv'][0] += u
-    a['uv'][1] += v
-    a['uv_count'] = int(a.get('uv_count', 0)) + 1
-    a['uv_min_u'] = min(float(a.get('uv_min_u', u)), u)
-    a['uv_max_u'] = max(float(a.get('uv_max_u', u)), u)
-    a['uv_min_v'] = min(float(a.get('uv_min_v', v)), v)
-    a['uv_max_v'] = max(float(a.get('uv_max_v', v)), v)
-    counts = a.setdefault('uv_values', collections.Counter())
-    counts[(round(u, 6), round(v, 6))] += 1
-
 def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, cp_map: list[tuple[int, int]]) -> dict:
     fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
     if abs(fbx_export_scale) < 1e-8:
         fbx_export_scale=1.0
-    accum=collections.defaultdict(lambda: {'pos':[0.0,0.0,0.0], 'norm':[0.0,0.0,0.0], 'uv':[0.0,0.0], 'uv_samples':[], 'n':0, 'weights':collections.defaultdict(float), 'wn':0})
+    accum=collections.defaultdict(lambda: {'pos':[0.0,0.0,0.0], 'norm':[0.0,0.0,0.0], 'uv':[0.0,0.0], 'n':0, 'weights':collections.defaultdict(float), 'wn':0})
     verts=fbx['vertices']
     cp_seq=fbx['polygon_cp_sequence']
     for pv_i,(sm_i,src_i) in enumerate(cp_map):
@@ -666,8 +554,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         elif fbx['uv_by_cp'] and cp_i < len(fbx['uv_by_cp']): uv=fbx['uv_by_cp'][cp_i]
         else: uv=None
         if uv:
-            a['uv_samples'].append((uv[0], uv[1]))
-            _add_uv_to_accum(a, uv)
+            a['uv'][0]+=uv[0]; a['uv'][1]+=uv[1]
         wmap=fbx['weights_by_cp'].get(cp_i)
         if wmap:
             for bn,wt in wmap.items(): a['weights'][bn]+=wt
@@ -677,7 +564,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
     bone_name_to_id={b['name']:int(b['idx']) for b in bones}
     for b in bones:
         bone_name_to_id.setdefault(str(b['name']).replace(' ','_'), int(b['idx']))
-    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0
+    patched=0; weights_patched=0; reduced=0
     submeshes=manifest['mesh_stats']
     for (sm_i,src_i),a in accum.items():
         n=max(1,a['n'])
@@ -687,11 +574,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
         pos=(a['pos'][0]/n/fbx_export_scale,a['pos'][1]/n/fbx_export_scale,a['pos'][2]/n/fbx_export_scale)
         norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
-        stored_native_uv = _native_stored_uv(shape, manifest, sm_i, src_i)
-        native_uv = (stored_native_uv[0], 1.0 - stored_native_uv[1]) if stored_native_uv is not None else None
-        uv, uv_conflict = _uv_from_accum(a, n, layout, native_uv)
-        if uv_conflict:
-            uv_conflicts_preserved += 1
+        uv=(a['uv'][0]/n,a['uv'][1]/n) if any(abs(x)>1e-8 for x in a['uv']) else None
         struct.pack_into('>3f', shape, off, *pos)
         if layout == 'skin64':
             if uv: struct.pack_into('>2f', shape, off+20, float(uv[0]), float(1.0-uv[1]))
@@ -752,23 +635,22 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
                     struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
                     weights_patched+=1
         patched += 1
-    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'fbx_export_scale':fbx_export_scale}
+    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'fbx_export_scale':fbx_export_scale}
 
 def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest: dict, report: dict, cp_map: list[tuple[int, int]] | None = None) -> bool:
     old_cp_count = int(manifest.get('control_points') or 0)
     old_face_count = int(manifest.get('triangles') or 0)
-    faces = [list(int(v) for v in f) for f in (fbx.get('polygon_faces') or []) if len(f) == 3]
+    faces = [tuple(int(v) for v in f) for f in (fbx.get('polygon_faces') or []) if len(f) == 3]
     vertices = list(fbx.get('vertices') or [])
     if old_cp_count <= 0 or old_face_count <= 0 or len(faces) <= old_face_count:
         return False
 
     new_faces = faces[old_face_count:]
-    if not new_faces:
+    if not new_faces or any(any(v < old_cp_count for v in tri) for tri in new_faces):
         return False
     if any(any(v >= len(vertices) for v in tri) for tri in new_faces):
         return False
 
-    pristine_shape = bytes(shape)
     existing_patch = {}
     if cp_map is not None:
         try:
@@ -916,129 +798,8 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
     if not group_votes:
         return False
     owner_group = group_votes.most_common(1)[0][0]
-
-    def native_uv_for_source(sm_i: int, src_i: int):
-        return _native_stored_uv(pristine_shape, manifest, sm_i, src_i)
-
-    split_uv_vertices = 0
-    split_uv_faces = set()
-    preserve_original_face_keys = collections.defaultdict(list)
-    by_source = collections.defaultdict(list)
-    can_split_old_face_uvs = len(vertices) >= old_cp_count
-
-    def corner_uv_for_face(face_i: int, corner_i: int, cp_i: int):
-        pv_i = face_i * 3 + corner_i
-        uv = None
-        if fbx.get('uv_by_pv') and pv_i < len(fbx['uv_by_pv']):
-            uv = fbx['uv_by_pv'][pv_i]
-        elif fbx.get('uv_by_cp') and cp_i < len(fbx['uv_by_cp']):
-            uv = fbx['uv_by_cp'][cp_i]
-        if uv is None:
-            return None
-        return (float(uv[0]), float(1.0 - uv[1]))
-
-    def corner_normal_for_face(face_i: int, corner_i: int, cp_i: int):
-        pv_i = face_i * 3 + corner_i
-        if fbx.get('normal_by_pv') and pv_i < len(fbx['normal_by_pv']):
-            return tuple(map(float, fbx['normal_by_pv'][pv_i]))
-        if fbx.get('normal_by_cp') and cp_i < len(fbx['normal_by_cp']):
-            return tuple(map(float, fbx['normal_by_cp'][cp_i]))
-        return payload_normals[cp_i] if cp_i < len(payload_normals) else (0.0, 0.0, 1.0)
-
-    if can_split_old_face_uvs:
-        for face_i in range(old_face_count):
-            for corner_i, cp_i in enumerate(faces[face_i]):
-                if not (0 <= cp_i < len(vertex_src)):
-                    continue
-                src = vertex_src[cp_i]
-                try:
-                    sm_i, src_i = cp_map[cp_i]
-                    layout = str(src[2])
-                except Exception:
-                    continue
-                if sm_i != owner_group:
-                    continue
-                uv = corner_uv_for_face(face_i, corner_i, cp_i)
-                if uv is None:
-                    continue
-                by_source[(sm_i, src_i, layout)].append((face_i, corner_i, cp_i, uv))
-
-    for src, uses in by_source.items():
-        if len(uses) < 2:
-            continue
-        us = [float(u[3][0]) for u in uses]
-        vs = [float(u[3][1]) for u in uses]
-        uv_spread = max(max(us) - min(us), max(vs) - min(vs))
-        if uv_spread <= 1e-5:
-            continue
-        groups = collections.defaultdict(list)
-        for use in uses:
-            uv = use[3]
-            groups[(round(float(uv[0]), 5), round(float(uv[1]), 5))].append(use)
-        if len(groups) < 2:
-            continue
-        original_uv = native_uv_for_source(src[0], src[1])
-        if original_uv is not None:
-            keep_key = min(
-                groups,
-                key=lambda k: (float(k[0]) - float(original_uv[0])) ** 2 + (float(k[1]) - float(original_uv[1])) ** 2,
-            )
-        else:
-            keep_key = max(groups, key=lambda k: len(groups[k]))
-        for key, group_uses in groups.items():
-            if key == keep_key:
-                continue
-            for face_i, corner_i, cp_i, _uv in group_uses:
-                try:
-                    original_key = []
-                    for original_cp in faces[face_i]:
-                        _sm, _src = cp_map[original_cp]
-                        if int(_sm) != owner_group:
-                            original_key = []
-                            break
-                        original_key.append(int(_src))
-                    if len(original_key) == 3 and len(set(original_key)) == 3:
-                        preserve_original_face_keys[int(owner_group)].append(tuple(sorted(original_key)))
-                except Exception:
-                    pass
-                new_cp = len(payload_vertices)
-                payload_vertices.append(payload_vertices[cp_i])
-                payload_normals.append(corner_normal_for_face(face_i, corner_i, cp_i))
-                payload_uvs.append(_uv)
-                payload_weights.append(payload_weights[cp_i])
-                vertex_src.append((-1, new_cp, 'virtual', tuple(vertex_src[cp_i])))
-                faces[face_i][corner_i] = new_cp
-                split_uv_vertices += 1
-                split_uv_faces.add(face_i)
-
     owner_candidates = [item for item in source_items if int(item['sm_i']) == owner_group] or source_items
-    appended_virtual_vertices = 0
-    for face_i in range(old_face_count, len(faces)):
-        for corner_i, cp_i in enumerate(faces[face_i]):
-            pos = payload_vertices[cp_i]
-            uv = corner_uv_for_face(face_i, corner_i, cp_i)
-            if uv is None and cp_i < len(payload_uvs):
-                uv = payload_uvs[cp_i]
-            nrm = corner_normal_for_face(face_i, corner_i, cp_i)
-            item = nearest(owner_candidates, pos, uv, nrm)
-            if item is None:
-                return False
-            new_cp = len(payload_vertices)
-            payload_vertices.append(pos)
-            payload_normals.append(nrm)
-            payload_uvs.append(uv if uv is not None else (0.0, 0.0))
-            payload_weights.append(payload_weights[cp_i] if cp_i < len(payload_weights) else [])
-            vertex_src.append((-1, new_cp, 'virtual', tuple(item['src'])))
-            faces[face_i][corner_i] = new_cp
-            appended_virtual_vertices += 1
-    new_cp_ids = list(range(len(payload_vertices) - appended_virtual_vertices, len(payload_vertices)))
     for cp in range(old_cp_count, len(payload_vertices)):
-        if cp < len(vertex_src):
-            try:
-                if str(vertex_src[cp][2]) == 'virtual':
-                    continue
-            except Exception:
-                pass
         item = nearest(owner_candidates, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
         if item is None:
             return False
@@ -1052,8 +813,6 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
         'triangles': faces,
         'tri_groups': tri_groups + [owner_group] * len(new_faces),
         'vertex_src': vertex_src,
-        'preserve_original_display_lists': True,
-        'preserve_original_face_keys': {str(k): v for k, v in preserve_original_face_keys.items()},
     }
 
     tmp_name = None
@@ -1080,15 +839,11 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
         'status': 'patched_added_topology',
         'new_faces': len(new_faces),
         'new_vertices': len(new_cp_ids),
-        'appended_face_vertices': appended_virtual_vertices,
         'owner_template_submesh': owner_group,
         'template_group_votes': dict(group_votes),
         'existing_source_vertices_patched': existing_patch.get('source_vertices_patched', 0),
         'existing_weights_patched': existing_patch.get('weights_patched', 0),
         'existing_weights_reduced_to_source_limits': existing_patch.get('weights_reduced_to_source_limits', 0),
-        'existing_uv_conflicts_preserved': existing_patch.get('uv_conflicts_preserved', 0),
-        'split_uv_vertices': split_uv_vertices,
-        'split_uv_faces': len(split_uv_faces),
         'new_weights_patched': sum(1 for cp in new_cp_ids if cp < len(payload_weights) and payload_weights[cp]),
         'old_size': len(old_shape),
         'new_size': len(shape),
@@ -1131,7 +886,8 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
         if fbx['uv_by_pv'] and pv_i < len(fbx['uv_by_pv']): uv=fbx['uv_by_pv'][pv_i]
         elif fbx['uv_by_cp'] and cp_i < len(fbx['uv_by_cp']): uv=fbx['uv_by_cp'][cp_i]
         else: uv=None
-        _add_uv_to_accum(a, uv)
+        if uv:
+            a['uv'][0]+=uv[0]; a['uv'][1]+=uv[1]
         wmap=fbx['weights_by_cp'].get(cp_i)
         if wmap:
             for bn,wt in wmap.items(): a['weights'][bn]+=wt
@@ -1142,7 +898,7 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
     # Also allow Cluster names that use underscores instead of spaces.
     for b in bones:
         bone_name_to_id.setdefault(str(b['name']).replace(' ','_'), int(b['idx']))
-    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0
+    patched=0; weights_patched=0; reduced=0
     submeshes=manifest['mesh_stats']
     for (sm_i,src_i),a in accum.items():
         n=max(1,a['n'])
@@ -1153,9 +909,7 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
         layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
         pos=(a['pos'][0]/n/fbx_export_scale,a['pos'][1]/n/fbx_export_scale,a['pos'][2]/n/fbx_export_scale)
         norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
-        uv, uv_conflict = _uv_from_accum(a, n, layout)
-        if uv_conflict:
-            uv_conflicts_preserved += 1
+        uv=(a['uv'][0]/n,a['uv'][1]/n) if any(abs(x)>1e-8 for x in a['uv']) else None
         struct.pack_into('>3f', shape, off, *pos)
         if layout == 'skin64':
             if uv: struct.pack_into('>2f', shape, off+20, float(uv[0]), float(1.0-uv[1]))
@@ -1216,7 +970,7 @@ def patch_mesh_from_fbx(shape: bytearray, extracted: Path, manifest: dict, repor
                     struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
                     weights_patched+=1
         patched += 1
-    report['mesh_patch']={'status':'patched','source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'fbx_version':fbx['version'],'fbx_export_scale':fbx_export_scale}
+    report['mesh_patch']={'status':'patched','source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'fbx_version':fbx['version'],'fbx_export_scale':fbx_export_scale}
 
 def patch_skeleton_from_fbx(shape: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
     fbx_path=extracted / manifest.get('fbx','Godzilla2K.fbx')

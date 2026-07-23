@@ -384,6 +384,18 @@ def save_topology_payload_to_bdg(shape_path: str | Path, payload: dict[str, Any]
     triangles = [tuple(t) for t in (payload.get('triangles') or [])]
     tri_groups = list(payload.get('tri_groups') or [])
     vertex_src = list(payload.get('vertex_src') or [])
+    preserve_original_display_lists = bool(payload.get('preserve_original_display_lists'))
+    preserve_original_face_keys_raw = payload.get('preserve_original_face_keys') or {}
+    preserve_delete_keys_by_group: dict[int, set[tuple[int, int, int]]] = {}
+    if isinstance(preserve_original_face_keys_raw, dict):
+        for group_key, keys in preserve_original_face_keys_raw.items():
+            try:
+                group_i = int(group_key)
+            except Exception:
+                continue
+            preserve_delete_keys_by_group[group_i] = {
+                _tri_key(key) for key in (keys or []) if len(key) == 3
+            }
 
     if len(tri_groups) != len(triangles):
         tri_groups = [tri_groups[i] if i < len(tri_groups) else 0 for i in range(len(triangles))]
@@ -884,6 +896,18 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
     triangles = [tuple(t) for t in (payload.get('triangles') or [])]
     tri_groups = list(payload.get('tri_groups') or [])
     vertex_src = list(payload.get('vertex_src') or [])
+    preserve_original_display_lists = bool(payload.get('preserve_original_display_lists'))
+    preserve_original_face_keys_raw = payload.get('preserve_original_face_keys') or {}
+    preserve_delete_keys_by_group: dict[int, set[tuple[int, int, int]]] = {}
+    if isinstance(preserve_original_face_keys_raw, dict):
+        for group_key, keys in preserve_original_face_keys_raw.items():
+            try:
+                group_i = int(group_key)
+            except Exception:
+                continue
+            preserve_delete_keys_by_group[group_i] = {
+                _tri_key(key) for key in (keys or []) if len(key) == 3
+            }
     if len(tri_groups) != len(triangles):
         tri_groups = [tri_groups[i] if i < len(tri_groups) else 0 for i in range(len(triangles))]
 
@@ -984,6 +1008,9 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
     current_original_keys_by_group = []
     for sj, sj_sm in enumerate(submeshes):
         keys = set()
+        if preserve_original_display_lists:
+            current_original_keys_by_group.append({_tri_key(face) for face in sj_sm.get('faces', [])})
+            continue
         for tri, g in zip(triangles, tri_groups):
             if int(g) != sj:
                 continue
