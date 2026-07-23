@@ -82,6 +82,40 @@ def encode_i8_png(path: Path, width: int, height: int) -> bytes:
             out.append(pix[xx,yy] if xx<width and yy<height else 0)
     return bytes(out)
 
+def encode_ia4_png(path: Path, width: int, height: int) -> bytes:
+    img = Image.open(path).convert('RGBA').resize((width, height))
+    pix = img.load(); out=bytearray()
+    for ty in range(0,height,4):
+      for tx in range(0,width,8):
+        for y in range(4):
+          for x in range(8):
+            xx,yy=tx+x,ty+y
+            if xx<width and yy<height:
+                r,g,b,a = pix[xx,yy]
+                i = round((r*0.299 + g*0.587 + b*0.114) * 15 / 255)
+                an = round(a * 15 / 255)
+            else:
+                i = 0; an = 0
+            out.append((max(0,min(15,an)) << 4) | max(0,min(15,i)))
+    return bytes(out)
+
+def encode_ia8_png(path: Path, width: int, height: int) -> bytes:
+    img = Image.open(path).convert('RGBA').resize((width, height))
+    pix = img.load(); out=bytearray()
+    for ty in range(0,height,4):
+      for tx in range(0,width,4):
+        for y in range(4):
+          for x in range(4):
+            xx,yy=tx+x,ty+y
+            if xx<width and yy<height:
+                r,g,b,a = pix[xx,yy]
+                i = round(r*0.299 + g*0.587 + b*0.114)
+            else:
+                i = 0; a = 0
+            out.append(max(0,min(255,a)))
+            out.append(max(0,min(255,i)))
+    return bytes(out)
+
 def nearest_palette_index(rgb, pal, allow_alpha=False, alpha=255):
     if allow_alpha and alpha < 128:
         return 3
@@ -468,8 +502,47 @@ def texture_changed(extracted: Path, manifest: dict, rel: str) -> bool:
     if not old: return True
     return sha256_file(p) != old
 
+def _texture_specs_for_writeback(shape: bytes | bytearray, manifest: dict):
+    specs = list(manifest.get('texture_specs') or [])
+    if specs:
+        return specs
+    textures = list(manifest.get('textures') or [])
+    if not textures:
+        return []
+    abs_by_rid = {}
+    try:
+        from bdg_to_fbx_extract_all import texture_entries
+        entries, data_base = texture_entries(bytes(shape))
+        for e in entries:
+            abs_by_rid[int(e.get('rid'))] = int(e.get('abs'))
+    except Exception:
+        data_base = None
+    out = []
+    for tex in textures:
+        try:
+            filename = tex.get('file') or tex.get('filename')
+            fmt = tex.get('format')
+            w = int(tex.get('width'))
+            h = int(tex.get('height'))
+        except Exception:
+            continue
+        off = None
+        try:
+            rid = int(tex.get('rid'))
+            off = abs_by_rid.get(rid)
+        except Exception:
+            off = None
+        if off is None and data_base is not None and tex.get('rel') is not None:
+            try:
+                off = int(data_base) + parse_int_maybe_hex(tex.get('rel'))
+            except Exception:
+                off = None
+        if filename and fmt and off is not None:
+            out.append({'filename': filename, 'format': fmt, 'width': w, 'height': h, 'absolute_offset': off})
+    return out
+
 def patch_textures(shape: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
-    for spec in manifest.get('texture_specs', []):
+    for spec in _texture_specs_for_writeback(shape, manifest):
         tex_name=spec['filename']; tex_path=extracted/'textures'/tex_name
         if not tex_path.exists():
             report['texture_patches'].append({'texture':tex_name,'status':'skipped_missing_png'}); continue
@@ -480,9 +553,11 @@ def patch_textures(shape: bytearray, extracted: Path, manifest: dict, report: di
             if fmt == 'CMPR': payload=encode_cmpr_png(tex_path,w,h)
             elif fmt == 'RGB565': payload=encode_rgb565_png(tex_path,w,h)
             elif fmt == 'I8': payload=encode_i8_png(tex_path,w,h)
+            elif fmt == 'IA4': payload=encode_ia4_png(tex_path,w,h)
+            elif fmt == 'IA8': payload=encode_ia8_png(tex_path,w,h)
             else:
                 report['texture_patches'].append({'texture':tex_name,'format':fmt,'status':'skipped_encoder_not_implemented'}); continue
-            expected={'CMPR':w*h//2,'RGB565':w*h*2,'I8':w*h}[fmt]
+            expected={'CMPR':w*h//2,'RGB565':w*h*2,'I8':w*h,'IA4':w*h,'IA8':w*h*2}[fmt]
             if len(payload) != expected: raise ValueError(f'encoded size {len(payload)} != expected {expected}')
             shape[off:off+expected]=payload
             report['texture_patches'].append({'texture':tex_name,'format':fmt,'offset':hex(off),'bytes':expected,'status':'patched'})
@@ -687,7 +762,7 @@ def _add_uv_to_accum(a: dict, uv):
     counts = a.setdefault('uv_values', collections.Counter())
     counts[(round(u, 6), round(v, 6))] += 1
 
-def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, cp_map: list[tuple[int, int]]) -> dict:
+def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, cp_map: list[tuple[int, int]], allowed_submeshes: set[int] | None = None, pv_index_map: list[int] | None = None, preserve_small_move_weights_threshold: float = 0.0) -> dict:
     fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
     if abs(fbx_export_scale) < 1e-8:
         fbx_export_scale=1.0
@@ -696,9 +771,12 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
     cp_seq=fbx['polygon_cp_sequence']
     skipped_misaligned = 0
     for pv_i,(sm_i,src_i) in enumerate(cp_map):
-        if pv_i >= len(cp_seq):
-            raise ValueError(f'FBX polygon vertex stream ended early at {pv_i}; expected at least {len(cp_map)}')
-        cp_i=cp_seq[pv_i]
+        if allowed_submeshes is not None and int(sm_i) not in allowed_submeshes:
+            continue
+        fbx_pv_i = pv_index_map[pv_i] if pv_index_map is not None and pv_i < len(pv_index_map) else pv_i
+        if fbx_pv_i >= len(cp_seq):
+            raise ValueError(f'FBX polygon vertex stream ended early at {fbx_pv_i}; expected at least {len(cp_map)}')
+        cp_i=cp_seq[fbx_pv_i]
         if cp_i < 0 or cp_i >= len(verts):
             raise ValueError(f'invalid FBX polygon index {cp_i}')
         key=(sm_i,src_i); a=accum[key]
@@ -711,12 +789,12 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
                 skipped_misaligned += 1
                 continue
         _add_pos_to_accum(a, p)
-        if fbx['normal_by_pv'] and pv_i < len(fbx['normal_by_pv']): n=fbx['normal_by_pv'][pv_i]
+        if fbx['normal_by_pv'] and fbx_pv_i < len(fbx['normal_by_pv']): n=fbx['normal_by_pv'][fbx_pv_i]
         elif fbx['normal_by_cp'] and cp_i < len(fbx['normal_by_cp']): n=fbx['normal_by_cp'][cp_i]
         else: n=None
         if n:
             a['norm'][0]+=n[0]; a['norm'][1]+=n[1]; a['norm'][2]+=n[2]
-        if fbx['uv_by_pv'] and pv_i < len(fbx['uv_by_pv']): uv=fbx['uv_by_pv'][pv_i]
+        if fbx['uv_by_pv'] and fbx_pv_i < len(fbx['uv_by_pv']): uv=fbx['uv_by_pv'][fbx_pv_i]
         elif fbx['uv_by_cp'] and cp_i < len(fbx['uv_by_cp']): uv=fbx['uv_by_cp'][cp_i]
         else: uv=None
         if uv:
@@ -731,7 +809,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
     bone_name_to_id={b['name']:int(b['idx']) for b in bones}
     for b in bones:
         bone_name_to_id.setdefault(str(b['name']).replace(' ','_'), int(b['idx']))
-    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0; position_conflicts_preserved=0
+    patched=0; weights_patched=0; reduced=0; uv_conflicts_preserved=0; position_conflicts_preserved=0; weights_preserved_for_small_moves=0
     submeshes=manifest['mesh_stats']
     for (sm_i,src_i),a in accum.items():
         n=max(1,a['n'])
@@ -743,6 +821,9 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         pos, pos_conflict = _pos_from_accum(a, n, fbx_export_scale, native_pos)
         if pos_conflict:
             position_conflicts_preserved += 1
+        preserve_weights = False
+        if preserve_small_move_weights_threshold > 0.0 and native_pos is not None:
+            preserve_weights = math.dist(native_pos, pos) <= preserve_small_move_weights_threshold
         norm=norm3((a['norm'][0]/n,a['norm'][1]/n,a['norm'][2]/n)) if any(abs(x)>1e-8 for x in a['norm']) else None
         stored_native_uv = _native_stored_uv(shape, manifest, sm_i, src_i)
         native_uv = (stored_native_uv[0], 1.0 - stored_native_uv[1]) if stored_native_uv is not None else None
@@ -753,7 +834,9 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         if layout == 'skin64':
             if uv: struct.pack_into('>2f', shape, off+20, float(uv[0]), float(1.0-uv[1]))
             if norm: struct.pack_into('>3f', shape, off+28, *norm)
-            if a['wn']:
+            if a['wn'] and preserve_weights:
+                weights_preserved_for_small_moves += 1
+            elif a['wn']:
                 wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
                 top=choose_top_weights(wavg, bone_name_to_id, 2)
                 if top:
@@ -768,7 +851,9 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         elif layout in ('skin40','skin48'):
             if norm: struct.pack_into('>3f', shape, off+20, *norm)
             if uv: struct.pack_into('>2f', shape, off+32, float(uv[0]), float(1.0-uv[1]))
-            if a['wn']:
+            if a['wn'] and preserve_weights:
+                weights_preserved_for_small_moves += 1
+            elif a['wn']:
                 wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
                 top=choose_top_weights(wavg, bone_name_to_id, 2)
                 if top:
@@ -783,7 +868,9 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         elif layout in ('blend52','blend60'):
             if norm: struct.pack_into('>3f', shape, off+32, *norm)
             if uv: struct.pack_into('>2f', shape, off+44, float(uv[0]), float(1.0-uv[1]))
-            if a['wn']:
+            if a['wn'] and preserve_weights:
+                weights_preserved_for_small_moves += 1
+            elif a['wn']:
                 wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
                 top=choose_top_weights(wavg, bone_name_to_id, 4)
                 if top:
@@ -797,7 +884,9 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
         else:
             if uv: struct.pack_into('>2f', shape, off+32, float(uv[0]), float(1.0-uv[1]))
             if norm: struct.pack_into('>3f', shape, off+40, *norm)
-            if a['wn']:
+            if a['wn'] and preserve_weights:
+                weights_preserved_for_small_moves += 1
+            elif a['wn']:
                 wavg={bn:wt/max(1,a['wn']) for bn,wt in a['weights'].items()}
                 top=choose_top_weights(wavg, bone_name_to_id, 4)
                 if top:
@@ -809,7 +898,7 @@ def _patch_existing_mesh_vertices(shape: bytearray, fbx: dict, manifest: dict, c
                     struct.pack_into('>4H', shape, off+24, int(top[0][0]), int(top[1][0]), int(top[2][0]), int(top[3][0]))
                     weights_patched+=1
         patched += 1
-    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'position_conflicts_preserved':position_conflicts_preserved,'misaligned_polygon_corners_skipped':skipped_misaligned,'fbx_export_scale':fbx_export_scale}
+    return {'source_vertices_patched':patched,'weights_patched':weights_patched,'weights_preserved_for_small_moves':weights_preserved_for_small_moves,'weights_reduced_to_source_limits':reduced,'uv_conflicts_preserved':uv_conflicts_preserved,'position_conflicts_preserved':position_conflicts_preserved,'misaligned_polygon_corners_skipped':skipped_misaligned,'fbx_export_scale':fbx_export_scale}
 
 def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest: dict, report: dict, cp_map: list[tuple[int, int]] | None = None) -> bool:
     old_cp_count = int(manifest.get('control_points') or 0)
@@ -819,33 +908,24 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
     if old_cp_count <= 0 or old_face_count <= 0 or len(faces) <= old_face_count:
         return False
 
-    new_faces = faces[old_face_count:]
-    if not new_faces:
-        return False
-    if any(any(v >= len(vertices) for v in tri) for tri in new_faces):
-        return False
-
     pristine_shape = bytes(shape)
+    added_face_count = len(faces) - old_face_count
+    if added_face_count <= 0:
+        return False
     existing_patch = {}
-    if cp_map is not None:
-        try:
-            existing_patch = _patch_existing_mesh_vertices(shape, fbx, manifest, cp_map)
-        except Exception as exc:
-            report['mesh_patch'] = {'status': f'error: existing mesh patch before topology grow failed: {type(exc).__name__}: {exc}'}
-            return True
 
-    old_shape = bytes(shape)
+    old_shape = pristine_shape
     try:
         import bdg_to_fbx_extract_all as bdg
         import topology_bdg_writer as topo
-        parser, entries = _bundle_entries_from_bytes(old_shape)
+        parser, entries = _bundle_entries_from_bytes(pristine_shape)
         mesh_entries = [e for e in entries if e.get('file_type') == 17 and e.get('is_resource')]
         main_entries = [e for e in entries if e.get('file_type') == 17 and not e.get('is_resource')]
         if len(mesh_entries) != 1 or len(main_entries) != 1:
             return False
-        submeshes, _skipped = bdg.choose_meshes(old_shape, int(manifest.get('bone_count') or 0))
+        submeshes, _skipped = bdg.choose_meshes(pristine_shape, int(manifest.get('bone_count') or 0))
         endian = '>' if parser.is_big_endian else '<'
-        topo._find_mesh_descriptors(old_shape, main_entries[0], mesh_entries[0], submeshes, endian)
+        topo._find_mesh_descriptors(pristine_shape, main_entries[0], mesh_entries[0], submeshes, endian)
     except Exception as exc:
         report['mesh_patch'] = {'status': f'error: topology setup failed: {exc}'}
         return True
@@ -924,11 +1004,16 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
                 src = (int(sm['v_start']), int(src_idx), layout, rec) if rec else (int(sm['v_start']), int(src_idx), layout)
                 vertex_src.append(src)
                 if cp_i < len(payload_vertices):
+                    native_pos = payload_vertices[cp_i]
+                    try:
+                        native_pos = struct.unpack_from('>3f', pristine_shape, int(sm['v_start']) + int(src_idx) * stride)
+                    except Exception:
+                        pass
                     source_items.append({
                         'cp': cp_i,
                         'sm_i': sm_i,
                         'src': src,
-                        'pos': payload_vertices[cp_i],
+                        'pos': native_pos,
                         'uv': uv_for_cp(cp_i),
                         'normal': normal_for_cp(cp_i),
                     })
@@ -937,6 +1022,68 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
             tri_groups.append(sm_i)
     if len(vertex_src) != old_cp_count or len(tri_groups) != old_face_count:
         return False
+
+    boundaries = [0]
+    for i in range(1, len(tri_groups)):
+        if tri_groups[i] != tri_groups[i - 1]:
+            boundaries.append(i)
+    boundaries.append(old_face_count)
+
+    def face_insert_score(insert_face: int):
+        tail_faces = old_face_count - insert_face
+        if tail_faces <= 0:
+            return (float('inf'), 0)
+        sample_step = max(1, tail_faces // 256)
+        total = 0.0
+        count = 0
+        for old_face_i in range(insert_face, old_face_count, sample_step):
+            new_face_i = old_face_i + added_face_count
+            if new_face_i >= len(faces):
+                return (float('inf'), count)
+            for corner_i, cp_i in enumerate(faces[new_face_i]):
+                old_pv = old_face_i * 3 + corner_i
+                if not (0 <= cp_i < len(payload_vertices)) or old_pv >= len(source_items):
+                    continue
+                old_pos = source_items[old_pv]['pos']
+                new_pos = payload_vertices[cp_i]
+                total += math.dist(old_pos, new_pos)
+                count += 1
+        return (total / max(1, count), count)
+
+    insert_face = old_face_count
+    best_score = float('inf')
+    for candidate in boundaries[:-1]:
+        score, count = face_insert_score(candidate)
+        if count and (score < best_score - 0.01 or (abs(score - best_score) <= 0.01 and candidate < insert_face)):
+            best_score = score
+            insert_face = candidate
+    if best_score > 25.0:
+        insert_face = old_face_count
+
+    new_faces = faces[insert_face:insert_face + added_face_count]
+    if not new_faces:
+        return False
+    if any(any(v >= len(vertices) for v in tri) for tri in new_faces):
+        return False
+
+    existing_pv_index_map = []
+    added_cp_count = added_face_count * 3
+    for pv_i in range(old_cp_count):
+        face_i = pv_i // 3
+        if face_i >= insert_face:
+            existing_pv_index_map.append(pv_i + added_cp_count)
+        else:
+            existing_pv_index_map.append(pv_i)
+
+    for face_i in range(insert_face + added_face_count, len(faces)):
+        faces[face_i] = [int(v) - added_cp_count for v in faces[face_i]]
+
+    if cp_map is not None:
+        try:
+            existing_patch = _patch_existing_mesh_vertices(bytearray(pristine_shape), fbx, manifest, cp_map, pv_index_map=existing_pv_index_map)
+        except Exception as exc:
+            report['mesh_patch'] = {'status': f'error: existing mesh patch before topology grow failed: {type(exc).__name__}: {exc}'}
+            return True
 
     for cp_i in range(len(payload_vertices), old_cp_count):
         if cp_i < len(source_items):
@@ -979,13 +1126,50 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
 
     new_cp_ids = sorted({v for tri in new_faces for v in tri})
     group_votes = collections.Counter()
+    nearest_by_new_cp = {}
     for cp in new_cp_ids:
         item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
         if item:
+            nearest_by_new_cp[cp] = item
             group_votes[int(item['sm_i'])] += 1
     if not group_votes:
         return False
     owner_group = group_votes.most_common(1)[0][0]
+    source_items_by_group = collections.defaultdict(list)
+    for item in source_items:
+        source_items_by_group[int(item['sm_i'])].append(item)
+    layout_face_counts = collections.Counter()
+    for gi in tri_groups:
+        try:
+            layout_face_counts[(str(submeshes[int(gi)]['layout']), int(gi))] += 1
+        except Exception:
+            pass
+    primary_group_by_layout = {}
+    for (layout, gi), count in layout_face_counts.items():
+        old = primary_group_by_layout.get(layout)
+        if old is None or count > layout_face_counts[(layout, old)]:
+            primary_group_by_layout[layout] = gi
+
+    new_face_groups = []
+    raw_new_face_groups = []
+    for face_i in range(insert_face, insert_face + added_face_count):
+        face_votes = collections.Counter()
+        for cp in faces[face_i]:
+            item = nearest_by_new_cp.get(cp)
+            if item is None:
+                item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+                if item is not None:
+                    nearest_by_new_cp[cp] = item
+            if item is not None:
+                face_votes[int(item['sm_i'])] += 1
+        raw_group = face_votes.most_common(1)[0][0] if face_votes else owner_group
+        raw_new_face_groups.append(raw_group)
+        try:
+            raw_layout = str(submeshes[int(raw_group)]['layout'])
+            face_group = primary_group_by_layout.get(raw_layout, raw_group)
+        except Exception:
+            face_group = raw_group
+        new_face_groups.append(face_group)
 
     def native_uv_for_source(sm_i: int, src_i: int):
         return _native_stored_uv(pristine_shape, manifest, sm_i, src_i)
@@ -1171,14 +1355,16 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
 
     owner_candidates = [item for item in source_items if int(item['sm_i']) == owner_group] or source_items
     appended_virtual_vertices = 0
-    for face_i in range(old_face_count, len(faces)):
+    for face_i in range(insert_face, insert_face + added_face_count):
+        face_group = new_face_groups[face_i - insert_face] if face_i - insert_face < len(new_face_groups) else owner_group
+        face_owner_candidates = source_items_by_group.get(int(face_group)) or owner_candidates
         for corner_i, cp_i in enumerate(faces[face_i]):
             pos = payload_vertices[cp_i]
             uv = corner_uv_for_face(face_i, corner_i, cp_i)
             if uv is None and cp_i < len(payload_uvs):
                 uv = payload_uvs[cp_i]
             nrm = corner_normal_for_face(face_i, corner_i, cp_i)
-            item = nearest(owner_candidates, pos, uv, nrm)
+            item = nearest(face_owner_candidates, pos, uv, nrm)
             if item is None:
                 return False
             new_cp = len(payload_vertices)
@@ -1208,7 +1394,7 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
         'uvs': payload_uvs,
         'weights': payload_weights,
         'triangles': faces,
-        'tri_groups': tri_groups + [owner_group] * len(new_faces),
+        'tri_groups': tri_groups[:insert_face] + new_face_groups + tri_groups[insert_face:],
         'vertex_src': vertex_src,
         'preserve_original_display_lists': True,
         'preserve_original_face_keys': {str(k): v for k, v in preserve_original_face_keys.items()},
@@ -1221,6 +1407,29 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
             tmp_name = tmp.name
         topo.save_topology_payload_to_bdg(tmp_name, payload)
         shape[:] = Path(tmp_name).read_bytes()
+        try:
+            live_submeshes, _live_skipped = bdg.choose_meshes(bytes(shape), int(manifest.get('bone_count') or 0))
+            live_manifest = dict(manifest)
+            live_stats = []
+            original_stats = manifest.get('mesh_stats') or []
+            for i, sm in enumerate(live_submeshes):
+                item = dict(original_stats[i]) if i < len(original_stats) else {}
+                item.update({
+                    'submesh': i,
+                    'layout': str(sm['layout']),
+                    'display_list_start': hex(int(sm['dl_start'])),
+                    'display_list_end': hex(int(sm.get('dl_end', sm['v_start']))),
+                    'vertex_start': hex(int(sm['v_start'])),
+                    'vertex_stride': int(sm['v_stride']),
+                    'index_width': int(sm.get('index_width', 6)),
+                })
+                live_stats.append(item)
+            live_manifest['mesh_stats'] = live_stats
+            if cp_map is not None:
+                existing_patch = _patch_existing_mesh_vertices(shape, fbx, live_manifest, cp_map, pv_index_map=existing_pv_index_map)
+        except Exception as exc:
+            existing_patch = dict(existing_patch)
+            existing_patch['post_grow_patch_error'] = f'{type(exc).__name__}: {exc}'
     except Exception as exc:
         report['mesh_patch'] = {
             'status': f'error: topology grow failed: {type(exc).__name__}: {exc}',
@@ -1241,8 +1450,14 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
         'appended_face_vertices': appended_virtual_vertices,
         'owner_template_submesh': owner_group,
         'template_group_votes': dict(group_votes),
+        'raw_new_face_group_counts': dict(collections.Counter(raw_new_face_groups)),
+        'new_face_group_counts': dict(collections.Counter(new_face_groups)),
+        'insert_face': insert_face,
+        'added_face_count': added_face_count,
+        'insert_score': best_score,
         'existing_source_vertices_patched': existing_patch.get('source_vertices_patched', 0),
         'existing_weights_patched': existing_patch.get('weights_patched', 0),
+        'existing_weights_preserved_for_small_moves': existing_patch.get('weights_preserved_for_small_moves', 0),
         'existing_weights_reduced_to_source_limits': existing_patch.get('weights_reduced_to_source_limits', 0),
         'existing_uv_conflicts_preserved': existing_patch.get('uv_conflicts_preserved', 0),
         'existing_position_conflicts_preserved': existing_patch.get('position_conflicts_preserved', 0),

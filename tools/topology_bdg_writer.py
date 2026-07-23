@@ -933,7 +933,11 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
                 matched = gi
                 break
         if matched is None:
-            raise ValueError('New vertex template does not match a decoded BDG submesh stream')
+            decoded = [(i, int(sm['v_start']), str(sm['layout'])) for i, sm in enumerate(submeshes)]
+            raise ValueError(
+                f'New vertex template does not match a decoded BDG submesh stream: '
+                f'vid={vid} template={(t_v_start, _t_idx, t_layout)} decoded={decoded}'
+            )
         owner_groups.add(matched)
     groups_with_new_faces: dict[int, int] = {}
     for tri, g in zip(triangles, tri_groups):
@@ -1248,6 +1252,93 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
 # ---------------------------------------------------------------------------
 _safe_delete_entry_point = save_topology_payload_to_bdg
 
+def _virtual_groups_in_payload(payload: dict[str, Any]) -> set[int]:
+    triangles = [tuple(t) for t in (payload.get('triangles') or [])]
+    tri_groups = list(payload.get('tri_groups') or [])
+    vertex_src = list(payload.get('vertex_src') or [])
+    if len(tri_groups) != len(triangles):
+        tri_groups = [tri_groups[i] if i < len(tri_groups) else 0 for i in range(len(triangles))]
+    groups: set[int] = set()
+    for tri, group in zip(triangles, tri_groups):
+        has_virtual = False
+        for vid in tri:
+            if not isinstance(vid, int) or not (0 <= vid < len(vertex_src)):
+                continue
+            src = vertex_src[vid]
+            if len(src) >= 3 and str(src[2]) == 'virtual':
+                has_virtual = True
+                break
+        if has_virtual:
+            groups.add(int(group))
+    return groups
+
+def _payload_for_virtual_group(payload: dict[str, Any], keep_group: int) -> dict[str, Any]:
+    triangles = [tuple(t) for t in (payload.get('triangles') or [])]
+    tri_groups = list(payload.get('tri_groups') or [])
+    vertex_src = list(payload.get('vertex_src') or [])
+    if len(tri_groups) != len(triangles):
+        tri_groups = [tri_groups[i] if i < len(tri_groups) else 0 for i in range(len(triangles))]
+    keep_triangles = []
+    keep_groups = []
+    for tri, group in zip(triangles, tri_groups):
+        has_virtual = any(
+            isinstance(vid, int)
+            and 0 <= vid < len(vertex_src)
+            and len(vertex_src[vid]) >= 3
+            and str(vertex_src[vid][2]) == 'virtual'
+            for vid in tri
+        )
+        if has_virtual and int(group) != int(keep_group):
+            continue
+        keep_triangles.append(tri)
+        keep_groups.append(group)
+    out = dict(payload)
+    out['triangles'] = keep_triangles
+    out['tri_groups'] = keep_groups
+    return out
+
+def _retarget_payload_stream_offsets(payload: dict[str, Any], original_streams, current_submeshes) -> dict[str, Any]:
+    current_by_group = {
+        i: (int(sm['v_start']), str(sm['layout']))
+        for i, sm in enumerate(current_submeshes)
+    }
+    stream_to_group = {
+        (int(v_start), str(layout)): i
+        for i, (v_start, layout) in enumerate(original_streams)
+    }
+
+    def remap_template(tmpl):
+        try:
+            v_start, idx, layout = int(tmpl[0]), int(tmpl[1]), str(tmpl[2])
+        except Exception:
+            return tmpl
+        group = stream_to_group.get((v_start, layout))
+        if group is None or group not in current_by_group:
+            return tmpl
+        new_v_start, new_layout = current_by_group[group]
+        if len(tmpl) >= 4:
+            return (new_v_start, idx, new_layout, tmpl[3])
+        return (new_v_start, idx, new_layout)
+
+    remapped = []
+    for src in list(payload.get('vertex_src') or []):
+        try:
+            if len(src) >= 3 and str(src[2]) == 'virtual':
+                if len(src) >= 5:
+                    remapped.append((src[0], src[1], src[2], remap_template(src[3]), src[4]))
+                elif len(src) >= 4:
+                    remapped.append((src[0], src[1], src[2], remap_template(src[3])))
+                else:
+                    remapped.append(src)
+                continue
+            tmpl = remap_template(src)
+            remapped.append(tmpl if tmpl is not src else src)
+        except Exception:
+            remapped.append(src)
+    out = dict(payload)
+    out['vertex_src'] = remapped
+    return out
+
 def save_topology_payload_to_bdg(shape_path: str | Path, payload: dict[str, Any]):
     triangles = [tuple(t) for t in (payload.get('triangles') or [])]
     vertex_src = list(payload.get('vertex_src') or [])
@@ -1264,5 +1355,20 @@ def save_topology_payload_to_bdg(shape_path: str | Path, payload: dict[str, Any]
                 'This edit references a vertex without a stable original BDG source. Refusing save to avoid corrupting the model.'
             )
     if has_virtual:
+        groups = _virtual_groups_in_payload(payload)
+        if len(groups) > 1:
+            D, submeshes = _get_submeshes(shape_path)
+            original_streams = [(int(sm['v_start']), str(sm['layout'])) for sm in submeshes]
+            order = sorted(
+                groups,
+                key=lambda gi: int(submeshes[gi]['v_start']) if 0 <= gi < len(submeshes) else -1,
+                reverse=True,
+            )
+            for group in order:
+                _D_current, current_submeshes = _get_submeshes(shape_path)
+                group_payload = _payload_for_virtual_group(payload, group)
+                group_payload = _retarget_payload_stream_offsets(group_payload, original_streams, current_submeshes)
+                _save_added_topology_grow_v19(shape_path, group_payload)
+            return None
         return _save_added_topology_grow_v19(shape_path, payload)
     return _safe_delete_entry_point(shape_path, payload)
