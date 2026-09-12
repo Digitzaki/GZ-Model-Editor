@@ -1,3 +1,5 @@
+# To Be Updated to Reflect Version 3.0
+
 # Godzilla Blender Converter
 
 Godzilla Blender Converter is a small standalone bridge for moving Pipeworks Godzilla model files between the game formats and Blender-friendly FBX projects.
