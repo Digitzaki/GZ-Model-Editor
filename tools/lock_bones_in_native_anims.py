@@ -57,6 +57,8 @@ def first_record_xyz(records, layout: str):
         return tuple(int(x) for x in rec[:3])
     if layout == "continuation_time_qxyz" and len(rec) >= 4:
         return tuple(int(x) for x in rec[1:4])
+    if layout == "first_qxyz_then_time_qxyz" and len(rec) >= 4:
+        return tuple(int(x) for x in rec[1:4])
     return None
 
 
@@ -75,6 +77,16 @@ def patch_track(payload: bytearray, track: dict, xyz: tuple[int, int, int]) -> i
     elif layout == "continuation_time_qxyz":
         for i in range(count):
             off = rel + i * 8 + 2
+            if off + 6 > len(payload):
+                break
+            struct.pack_into(">hhh", payload, off, *xyz)
+            changed += 1
+    elif layout == "first_qxyz_then_time_qxyz":
+        if rel + 10 <= len(payload):
+            struct.pack_into(">hhh", payload, rel + 4, *xyz)
+            changed += 1
+        for i in range(1, count):
+            off = rel + 10 + (i - 1) * 8 + 2
             if off + 6 > len(payload):
                 break
             struct.pack_into(">hhh", payload, off, *xyz)
@@ -147,7 +159,12 @@ def main() -> int:
             if bone_id not in selected:
                 continue
             if args.mode == "rest":
-                xyz = quat_xyz_to_i16(selected[bone_id].get("local_quaternion_xyzw", (0, 0, 0, 1)))
+                xyz = quat_xyz_to_i16(
+                    selected[bone_id].get(
+                        "native_local_quaternion_xyzw",
+                        selected[bone_id].get("local_quaternion_xyzw", (0, 0, 0, 1)),
+                    )
+                )
             else:
                 xyz = first_record_xyz(tr.get("records", []), str(tr.get("layout", "")))
             if xyz is None:

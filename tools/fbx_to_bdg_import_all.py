@@ -8,9 +8,18 @@ if str(TOOL_DIR) not in sys.path:
 from fbx_to_bdg_import import (
     clean_windows_folder_arg, find_case_insensitive, patch_textures,
     patch_mesh_from_fbx, patch_skeleton_from_fbx, patch_raw_anims,
+    patch_deleted_bone_animation_locks, patch_mesh_for_skeleton_position_edits,
+    patch_type3_skeleton_from_report, patch_type4_skeleton_pose,
 )
 
-def import_one(root: Path, extracted: Path, force=False, patch_unchanged=False, with_skeleton=False):
+def import_one(
+    root: Path,
+    extracted: Path,
+    force=False,
+    patch_unchanged=False,
+    with_skeleton=False,
+    keep_mesh_in_place=False,
+):
     log_path=extracted/'import_log.json'
     manifest=json.loads(log_path.read_text(encoding='utf-8'))
     base=extracted.name[:-len('-Kaiju-Extracted')] if extracted.name.endswith('-Kaiju-Extracted') else extracted.name
@@ -54,13 +63,16 @@ def import_one(root: Path, extracted: Path, force=False, patch_unchanged=False, 
         'animation_resource_patches':[],
         'mesh_patch':{'status':'not_run'},
         'skeleton_patch':{'status':'not_run'},
-        'animation_action_patch':{'status':'strict_blocked_not_written','reason':'FBX/Blender Action curves are not exact native BDG resources, so they are not written. Exact same-size animations_import/*.bin or animations_raw/*.bin swaps are imported.'},
+        'animation_action_import':[],
         'limits':[
             'Mesh import requires the same FBX polygon order/topology as the extracted mesh.',
             'BDG vertex streams have fixed influence limits; extra FBX weights are reduced and reported.',
+            'New FBX leaf bones are added before mesh import and may receive weights during their first GUI import.',
             'Geometry positions/normals/UVs/weights import from same-topology FBX.',
+            'Changed BDG skeleton local positions import from FBX bone nodes; deleted/missing bone nodes preserve the original skeleton record.',
             'Texture PNGs import back into Shapes.BDG when encoded format is supported.',
-            'Exact native animation BIN resources import only when byte-for-byte same size. Put donor/edited native BINs in animations_import/ to force import, or replace animations_raw/*.bin.',
+            'Edited FBX Actions are rebuilt as native Type 4 clips when the extraction contains an Action baseline.',
+            'Exact native animation BIN resources may still be supplied in animations_import/ or animations_raw/.',
         ],
     }
 
@@ -75,12 +87,35 @@ def import_one(root: Path, extracted: Path, force=False, patch_unchanged=False, 
     if with_skeleton:
         try:
             patch_skeleton_from_fbx(shape, extracted, manifest, report, patch_unchanged=patch_unchanged)
+            if staged_anim:
+                patch_type3_skeleton_from_report(anim, report, 'animation')
+            patch_type4_skeleton_pose(shape, report, 'shapes')
+            if staged_anim:
+                patch_type4_skeleton_pose(anim, report, 'animation')
+            if keep_mesh_in_place:
+                report['mesh_skeleton_bake']={
+                    'status':'skipped_keep_mesh_in_place',
+                    'vertices_moved':0,
+                }
+            else:
+                patch_mesh_for_skeleton_position_edits(shape, manifest, report)
         except Exception as e:
             report['skeleton_patch']={'status':f'error: {type(e).__name__}: {e}'}
     else:
         report['skeleton_patch']={'status':'skipped_by_default_use_--with-skeleton'}
     if staged_anim:
+        if manifest.get('animation_action_baseline'):
+            from bdg_animation_import import import_bdg_actions
+
+            fbx_path=extracted/manifest.get('fbx', f'{base}.fbx')
+            anim, _action_results=import_bdg_actions(bytes(anim), fbx_path, manifest, report)
+            anim=bytearray(anim)
+        else:
+            report['animation_action_import'].append({'status':'skipped_missing_action_baseline'})
         patch_raw_anims(anim, extracted, manifest, report, patch_unchanged=patch_unchanged)
+        patch_deleted_bone_animation_locks(anim, extracted, manifest, report)
+    else:
+        patch_deleted_bone_animation_locks(anim, extracted, manifest, report)
 
     staged_shape.write_bytes(shape)
     if staged_anim:
@@ -104,6 +139,7 @@ def main():
     ap.add_argument('--force',action='store_true')
     ap.add_argument('--patch-unchanged',action='store_true')
     ap.add_argument('--with-skeleton', action='store_true', help='Also import FBX rest-pose bone transforms. Off by default because Blender FBX axis conversion can rotate monsters in-game.')
+    ap.add_argument('--keep-mesh-in-place', action='store_true', help='Do not automatically move weighted vertices with edited rest-bone positions.')
     args=ap.parse_args()
     root=Path(clean_windows_folder_arg(args.folder)).resolve()
     folders=sorted([p for p in root.iterdir() if p.is_dir() and p.name.endswith('-Kaiju-Extracted')])
@@ -115,7 +151,14 @@ def main():
     for f in folders:
         print(f'== Importing {f.name} ==')
         try:
-            r=import_one(root, f, force=args.force, patch_unchanged=args.patch_unchanged, with_skeleton=args.with_skeleton)
+            r=import_one(
+                root,
+                f,
+                force=args.force,
+                patch_unchanged=args.patch_unchanged,
+                with_skeleton=args.with_skeleton,
+                keep_mesh_in_place=args.keep_mesh_in_place,
+            )
             reports.append({
                 'folder':f.name,
                 'status':'ok',

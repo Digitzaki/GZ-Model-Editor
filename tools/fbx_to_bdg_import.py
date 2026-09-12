@@ -57,6 +57,18 @@ def rgb565_pack(r:int,g:int,b:int) -> int:
 def rgb565_unpack(c:int):
     return (((c>>11)&31)*255//31, ((c>>5)&63)*255//63, (c&31)*255//31, 255)
 
+def rgb5a3_pack(r:int,g:int,b:int,a:int) -> int:
+    if a < 224:
+        a3=max(0,min(7,round(a*7/255)))
+        r4=max(0,min(15,round(r*15/255)))
+        g4=max(0,min(15,round(g*15/255)))
+        b4=max(0,min(15,round(b*15/255)))
+        return (a3<<12)|(r4<<8)|(g4<<4)|b4
+    r5=max(0,min(31,round(r*31/255)))
+    g5=max(0,min(31,round(g*31/255)))
+    b5=max(0,min(31,round(b*31/255)))
+    return 0x8000|(r5<<10)|(g5<<5)|b5
+
 def encode_rgb565_png(path: Path, width: int, height: int) -> bytes:
     img = Image.open(path).convert('RGB').resize((width, height))
     pix = img.load(); out=bytearray()
@@ -68,6 +80,19 @@ def encode_rgb565_png(path: Path, width: int, height: int) -> bytes:
             xx,yy=tx+x,ty+y
             r,g,b = pix[xx,yy] if xx<width and yy<height else (0,0,0)
             out += struct.pack('>H', rgb565_pack(r,g,b))
+    return bytes(out)
+
+def encode_rgb5a3_png(path: Path, width: int, height: int) -> bytes:
+    img = Image.open(path).convert('RGBA').resize((width, height))
+    pix = img.load(); out=bytearray()
+    # Wii RGB5A3 texture tiles are 4x4 pixels.
+    for ty in range(0,height,4):
+      for tx in range(0,width,4):
+        for y in range(4):
+          for x in range(4):
+            xx,yy=tx+x,ty+y
+            r,g,b,a = pix[xx,yy] if xx<width and yy<height else (0,0,0,0)
+            out += struct.pack('>H', rgb5a3_pack(r,g,b,a))
     return bytes(out)
 
 def encode_i8_png(path: Path, width: int, height: int) -> bytes:
@@ -176,6 +201,38 @@ def encode_cmpr_png(path: Path, width: int, height: int) -> bytes:
           out += dxt1_block_encode(block)
     return bytes(out)
 
+def texture_level_size(fmt: str, width: int, height: int) -> int:
+    if fmt == 'CMPR':
+        return max(8, width) * max(8, height) // 2
+    if fmt in ('RGB565', 'RGB5A3', 'IA8'):
+        return width * height * 2
+    if fmt in ('I8', 'IA4'):
+        return width * height
+    raise ValueError(f'unsupported texture format {fmt}')
+
+def encode_texture_png(path: Path, fmt: str, width: int, height: int) -> bytes:
+    if fmt == 'CMPR': return encode_cmpr_png(path,width,height)
+    if fmt == 'RGB565': return encode_rgb565_png(path,width,height)
+    if fmt == 'RGB5A3': return encode_rgb5a3_png(path,width,height)
+    if fmt == 'I8': return encode_i8_png(path,width,height)
+    if fmt == 'IA4': return encode_ia4_png(path,width,height)
+    if fmt == 'IA8': return encode_ia8_png(path,width,height)
+    raise ValueError(f'unsupported texture format {fmt}')
+
+def encode_texture_mip_chain_png(path: Path, fmt: str, width: int, height: int, mip_count: int, encoded_size: int | None = None) -> bytes:
+    out=bytearray()
+    mip_count=max(1,int(mip_count or 1))
+    for _ in range(mip_count):
+        payload=encode_texture_png(path,fmt,width,height)
+        expected=texture_level_size(fmt,width,height)
+        if len(payload) != expected:
+            raise ValueError(f'encoded mip {width}x{height} size {len(payload)} != expected {expected}')
+        out += payload
+        width=max(1,width//2); height=max(1,height//2)
+    if encoded_size is not None and len(out) != encoded_size:
+        raise ValueError(f'encoded mip chain size {len(out)} != expected resource size {encoded_size}')
+    return bytes(out)
+
 # ----------------------------- FBX binary parser -----------------------------
 
 class FbxNode:
@@ -277,13 +334,35 @@ def clean_fbx_object_name(s: str) -> str:
     s=s.replace('\x00\x01','')
     if '|' in s: s=s.split('|')[-1]
     if ':' in s: s=s.split(':')[-1]
-    return s
+    return s.strip()
 
 def p_values(properties70: FbxNode, prop_name: str):
     if not properties70: return None
     for p in properties70.children_named('P'):
         if p.props and p.props[0] == prop_name:
             return p.props[4:]
+    return None
+
+def bdg_bone_name_variants(name: str):
+    name=str(name).strip()
+    out=[]
+    def add(v):
+        if v and v not in out:
+            out.append(v)
+    add(name)
+    add(name.replace(' ', '_'))
+    add(name + 'Model')
+    add(name.replace(' ', '_') + 'Model')
+    return out
+
+def find_bdg_bone_model(models: dict, name: str):
+    for variant in bdg_bone_name_variants(name):
+        cand=models.get(variant)
+        if cand:
+            return cand
+    for k,v in models.items():
+        if any(k.endswith(variant) for variant in bdg_bone_name_variants(name)):
+            return v
     return None
 
 # ----------------------------- math -----------------------------
@@ -308,30 +387,174 @@ def euler_xyz_degrees_to_quat(rx,ry,rz):
 
 # ----------------------------- skeleton / display list helpers -----------------------------
 
-def parse_shapes_string_table(shape: bytes):
-    count=struct.unpack_from('<I', shape, 0x400)[0]
-    ptrs=struct.unpack_from('<'+'I'*count, shape, 0x404)
+def parse_shapes_string_table(shape: bytes, offset=0x400):
+    if offset < 0 or offset + 4 > len(shape):
+        raise ValueError(f'Invalid Shapes.BDG string table offset: {offset:#x}')
+    count=struct.unpack_from('<I', shape, offset)[0]
+    if count <= 0 or count > 65535 or offset + 4 + count*4 > len(shape):
+        raise ValueError(f'Invalid Shapes.BDG string count at {offset:#x}: {count}')
+    ptrs=struct.unpack_from('<'+'I'*count, shape, offset+4)
     out=[]
     for p in ptrs:
-        off=0x400+p; end=shape.find(b'\0', off)
+        off=offset+p
+        if off < offset or off >= len(shape):
+            raise ValueError(f'Invalid Shapes.BDG string pointer: {p:#x}')
+        end=shape.find(b'\0', off)
+        if end < 0:
+            raise ValueError(f'Unterminated Shapes.BDG string at {off:#x}')
         out.append(shape[off:end].decode('latin1', errors='replace'))
     return out
 
-def parse_skeleton_records(shape: bytes):
-    strings=parse_shapes_string_table(shape)
-    SKEL_BASE=0x0EE0; SKEL_ROOT=0x0F20
+def parse_skeleton_records(shape: bytes, manifest: dict | None = None):
+    manifest=manifest or {}
+    string_table_offset=parse_int_maybe_hex(manifest.get('string_table_offset', 0x400))
+    strings=parse_shapes_string_table(shape, string_table_offset)
+    skel_base=parse_int_maybe_hex(manifest.get('skeleton_base', 0x0EE0))
+    skel_root=parse_int_maybe_hex(manifest.get('skeleton_root', 0x0F20))
     records={}
     def rec(off):
+        if off < 0 or off + 48 > len(shape):
+            raise ValueError(f'Skeleton record is outside Shapes.BDG: {off:#x}')
         idx,parent,nchild,name_idx=struct.unpack_from('>4i', shape, off)
+        if not (0 <= idx < len(strings)):
+            raise ValueError(f'Invalid skeleton bone index {idx} at {off:#x}')
+        if not (-1 <= parent < len(strings)):
+            raise ValueError(f'Invalid skeleton parent index {parent} at {off:#x}')
+        if not (0 <= nchild < len(strings)):
+            raise ValueError(f'Invalid skeleton child count {nchild} at {off:#x}')
+        if not (0 <= name_idx < len(strings)):
+            raise ValueError(f'Invalid skeleton name index {name_idx} at {off:#x}')
+        if off + 48 + nchild*4 > len(shape):
+            raise ValueError(f'Skeleton child table is outside Shapes.BDG at {off:#x}')
         q=struct.unpack_from('>4f', shape, off+16)
         t=struct.unpack_from('>3f', shape, off+32)
         child_rels=struct.unpack_from('>'+('I'*nchild), shape, off+48) if nchild else ()
-        return {'idx':idx,'parent':parent,'nchild':nchild,'name_idx':name_idx,'name':strings[name_idx],'q':q,'t':t,'off':off,'children':[SKEL_BASE+c for c in child_rels]}
+        children=[skel_base+c for c in child_rels]
+        if any(c < 0 or c + 48 > len(shape) for c in children):
+            raise ValueError(f'Invalid skeleton child pointer at {off:#x}')
+        return {'idx':idx,'parent':parent,'nchild':nchild,'name_idx':name_idx,'name':strings[name_idx],'q':q,'t':t,'off':off,'children':children}
     def walk(off):
+        if off in {r['off'] for r in records.values()}:
+            return
         r=rec(off); records[r['idx']]=r
         for c in r['children']: walk(c)
-    walk(SKEL_ROOT)
+    walk(skel_root)
     return records
+
+def _qmat(q):
+    x,y,z,w=q
+    n=x*x+y*y+z*z+w*w
+    if n < 1e-12:
+        return [[1,0,0],[0,1,0],[0,0,1]]
+    s=2/n
+    xx,yy,zz=x*x*s,y*y*s,z*z*s
+    xy,xz,yz=x*y*s,x*z*s,y*z*s
+    wx,wy,wz=w*x*s,w*y*s,w*z*s
+    return [[1-yy-zz,xy-wz,xz+wy],[xy+wz,1-xx-zz,yz-wx],[xz-wy,yz+wx,1-xx-yy]]
+
+def _mm(a,b):
+    return [[sum(a[i][k]*b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+def _local_matrix(record):
+    r=_qmat(record['q'])
+    x,y,z=record['t']
+    return [[r[0][0],r[0][1],r[0][2],x],[r[1][0],r[1][1],r[1][2],y],[r[2][0],r[2][1],r[2][2],z],[0,0,0,1]]
+
+def _global_positions_from_records(records: dict[int, dict]):
+    mats={}
+    def mat_for(idx):
+        if idx in mats:
+            return mats[idx]
+        rec=records[idx]
+        parent=int(rec.get('parent', -1))
+        local=_local_matrix(rec)
+        mats[idx]=_mm(mat_for(parent), local) if parent in records else local
+        return mats[idx]
+    out={}
+    for idx in records:
+        m=mat_for(idx)
+        out[idx]=(float(m[0][3]), float(m[1][3]), float(m[2][3]))
+    return out
+
+def _bdg_vertex_weights(shape: bytes | bytearray, off: int, layout: str):
+    try:
+        if layout in ('skin64','skin48','skin40'):
+            w0=struct.unpack_from('>f', shape, off+12)[0]
+            b0,b1=struct.unpack_from('>2H', shape, off+16)
+            w0=max(0.0,min(1.0,float(w0)))
+            if b0 == b1:
+                return [(int(b0),1.0)]
+            return [(int(b0),w0),(int(b1),1.0-w0)]
+        w0,w1,w2=struct.unpack_from('>3f', shape, off+12)
+        bones=struct.unpack_from('>4H', shape, off+24)
+        vals=[max(0.0,float(w0)),max(0.0,float(w1)),max(0.0,float(w2))]
+        vals.append(max(0.0,1.0-sum(vals)))
+        total=sum(vals)
+        if total <= 1e-8:
+            return []
+        return [(int(b),v/total) for b,v in zip(bones, vals) if v > 1e-6]
+    except Exception:
+        return []
+
+def patch_mesh_for_skeleton_position_edits(shape: bytearray, manifest: dict, report: dict):
+    skel=report.get('skeleton_patch') or {}
+    changed=skel.get('changed_bones') or []
+    if not changed:
+        report['mesh_skeleton_bake']={'status':'skipped_no_changed_bones'}
+        return
+    old_globals={}
+    for bone in manifest.get('bones', []):
+        if 'idx' in bone and bone.get('global_position') is not None:
+            old_globals[int(bone['idx'])]=tuple(float(v) for v in bone['global_position'])
+    if not old_globals:
+        report['mesh_skeleton_bake']={'status':'skipped_missing_original_globals'}
+        return
+    new_records=parse_skeleton_records(bytes(shape), manifest)
+    new_globals=_global_positions_from_records(new_records)
+    deltas={}
+    for idx,old in old_globals.items():
+        new=new_globals.get(idx)
+        if not new:
+            continue
+        delta=(new[0]-old[0], new[1]-old[1], new[2]-old[2])
+        if any(abs(v) > 1e-4 for v in delta):
+            deltas[idx]=delta
+    if not deltas:
+        report['mesh_skeleton_bake']={'status':'skipped_no_global_bone_delta'}
+        return
+    moved=0
+    max_delta=0.0
+    for sm in manifest.get('mesh_stats', []):
+        count=int(sm.get('vertex_count') or 0)
+        stride=parse_int_maybe_hex(sm['vertex_stride'])
+        start=parse_int_maybe_hex(sm['vertex_start'])
+        layout={64:'skin64',76:'blend76',52:'blend52',60:'blend60',48:'skin48',40:'skin40'}.get(stride,'skin64')
+        for src_i in range(count):
+            off=start + src_i*stride
+            weights=_bdg_vertex_weights(shape, off, layout)
+            if not weights:
+                continue
+            dx=dy=dz=0.0
+            for bone,weight in weights:
+                delta=deltas.get(int(bone))
+                if not delta:
+                    continue
+                dx += delta[0]*weight
+                dy += delta[1]*weight
+                dz += delta[2]*weight
+            mag=math.sqrt(dx*dx+dy*dy+dz*dz)
+            if mag <= 1e-4:
+                continue
+            x,y,z=struct.unpack_from('>3f', shape, off)
+            struct.pack_into('>3f', shape, off, x+dx, y+dy, z+dz)
+            moved += 1
+            max_delta=max(max_delta, mag)
+    report['mesh_skeleton_bake']={
+        'status':'patched' if moved else 'skipped_no_weighted_vertices',
+        'vertices_moved':moved,
+        'bones_with_global_delta':len(deltas),
+        'max_weighted_delta':max_delta,
+    }
 
 CMD_QUADS=0x80; CMD_TRIS=0x90; CMD_TRI_STRIP=0x98; CMD_TRI_FAN=0xA0
 VALID={CMD_QUADS,CMD_TRIS,CMD_TRI_STRIP,CMD_TRI_FAN}
@@ -379,6 +602,35 @@ def read_display_list(shape: bytes, start: int, index_width: int = 6):
                 if a!=b and b!=c and a!=c: faces.append((a,b,c))
     return faces
 
+def _duplicate_seam_face_drops(shape: bytes, manifest: dict, cp: list[tuple[int,int]]):
+    expected_drops=int(manifest.get('duplicate_seam_faces_skipped') or 0)
+    if expected_drops <= 0 or len(cp)%3:
+        return set()
+    groups=collections.defaultdict(list)
+    face_count=len(cp)//3
+    for face_i in range(face_count):
+        positions=[]; uvs=[]
+        for sm_i,src_i in cp[face_i*3:face_i*3+3]:
+            sm=manifest['mesh_stats'][sm_i]
+            stride=parse_int_maybe_hex(sm['vertex_stride'])
+            off=parse_int_maybe_hex(sm['vertex_start'])+src_i*stride
+            positions.append(struct.unpack_from('>3f',shape,off))
+            uvs.append(_native_stored_uv(shape,manifest,sm_i,src_i) or (0.0,0.0))
+        key=tuple(sorted((round(float(p[0]),4),round(float(p[1]),4),round(float(p[2]),4)) for p in positions))
+        uv_span=max(math.dist(uvs[a],uvs[b]) for a,b in ((0,1),(1,2),(2,0)))
+        groups[key].append((face_i,uv_span))
+    drop=set()
+    for rows in groups.values():
+        if len(rows)<2:
+            continue
+        face_ids=[face_i for face_i,_span in rows]
+        if max(face_ids)-min(face_ids)<=64:
+            continue
+        spans=[span for _face_i,span in rows]
+        keep=(min(rows,key=lambda row:row[1]) if max(spans)-min(spans)>0.02 else max(rows,key=lambda row:row[0]))[0]
+        drop.update(face_i for face_i,_span in rows if face_i!=keep)
+    return drop if len(drop)==expected_drops else set()
+
 def build_cp_to_source_map(shape: bytes, manifest: dict):
     cp=[]
     for sm_i,sm in enumerate(manifest['mesh_stats']):
@@ -387,6 +639,10 @@ def build_cp_to_source_map(shape: bytes, manifest: dict):
         for f in faces:
             for idx in f:
                 cp.append((sm_i, idx))
+    drop=_duplicate_seam_face_drops(shape,manifest,cp)
+    if drop:
+        face_count=len(cp)//3
+        cp=[item for face_i in range(face_count) if face_i not in drop for item in cp[face_i*3:face_i*3+3]]
     return cp
 
 # ----------------------------- FBX extraction -----------------------------
@@ -526,6 +782,13 @@ def _texture_specs_for_writeback(shape: bytes | bytearray, manifest: dict):
             h = int(tex.get('height'))
         except Exception:
             continue
+        encoded_size = None
+        mip_count = tex.get('mip_count')
+        try:
+            if tex.get('size') is not None:
+                encoded_size = parse_int_maybe_hex(tex.get('size'))
+        except Exception:
+            encoded_size = None
         off = None
         try:
             rid = int(tex.get('rid'))
@@ -538,7 +801,12 @@ def _texture_specs_for_writeback(shape: bytes | bytearray, manifest: dict):
             except Exception:
                 off = None
         if filename and fmt and off is not None:
-            out.append({'filename': filename, 'format': fmt, 'width': w, 'height': h, 'absolute_offset': off})
+            spec = {'filename': filename, 'format': fmt, 'width': w, 'height': h, 'absolute_offset': off}
+            if mip_count is not None:
+                spec['mip_count'] = mip_count
+            if encoded_size is not None:
+                spec['encoded_size'] = encoded_size
+            out.append(spec)
     return out
 
 def patch_textures(shape: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
@@ -550,17 +818,17 @@ def patch_textures(shape: bytearray, extracted: Path, manifest: dict, report: di
             report['texture_patches'].append({'texture':tex_name,'status':'unchanged_not_patched'}); continue
         fmt=spec['format']; w=int(spec['width']); h=int(spec['height']); off=parse_int_maybe_hex(spec['absolute_offset'])
         try:
-            if fmt == 'CMPR': payload=encode_cmpr_png(tex_path,w,h)
-            elif fmt == 'RGB565': payload=encode_rgb565_png(tex_path,w,h)
-            elif fmt == 'I8': payload=encode_i8_png(tex_path,w,h)
-            elif fmt == 'IA4': payload=encode_ia4_png(tex_path,w,h)
-            elif fmt == 'IA8': payload=encode_ia8_png(tex_path,w,h)
-            else:
+            if fmt not in ('CMPR','RGB565','RGB5A3','I8','IA4','IA8'):
                 report['texture_patches'].append({'texture':tex_name,'format':fmt,'status':'skipped_encoder_not_implemented'}); continue
-            expected={'CMPR':w*h//2,'RGB565':w*h*2,'I8':w*h,'IA4':w*h,'IA8':w*h*2}[fmt]
+            mip_count = int(spec.get('mip_count') or 1)
+            encoded_size = spec.get('encoded_size')
+            expected = int(encoded_size) if encoded_size is not None else sum(
+                texture_level_size(fmt, max(1,w>>i), max(1,h>>i)) for i in range(mip_count)
+            )
+            payload=encode_texture_mip_chain_png(tex_path,fmt,w,h,mip_count,expected)
             if len(payload) != expected: raise ValueError(f'encoded size {len(payload)} != expected {expected}')
             shape[off:off+expected]=payload
-            report['texture_patches'].append({'texture':tex_name,'format':fmt,'offset':hex(off),'bytes':expected,'status':'patched'})
+            report['texture_patches'].append({'texture':tex_name,'format':fmt,'offset':hex(off),'bytes':expected,'mip_count':mip_count,'status':'patched'})
         except Exception as e:
             report['texture_patches'].append({'texture':tex_name,'format':fmt,'status':f'error: {e}'})
 
@@ -1003,25 +1271,51 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
                 rec = display_records[corner] if corner < len(display_records) else None
                 src = (int(sm['v_start']), int(src_idx), layout, rec) if rec else (int(sm['v_start']), int(src_idx), layout)
                 vertex_src.append(src)
-                if cp_i < len(payload_vertices):
-                    native_pos = payload_vertices[cp_i]
-                    try:
-                        native_pos = struct.unpack_from('>3f', pristine_shape, int(sm['v_start']) + int(src_idx) * stride)
-                    except Exception:
-                        pass
-                    source_items.append({
-                        'cp': cp_i,
-                        'sm_i': sm_i,
-                        'src': src,
-                        'pos': native_pos,
-                        'uv': uv_for_cp(cp_i),
-                        'normal': normal_for_cp(cp_i),
-                    })
+                native_pos=(0.0,0.0,0.0); native_uv=(0.0,0.0); native_normal=(0.0,0.0,1.0)
+                try:
+                    native_pos,native_uv,native_normal,_native_weights=bdg.parse_vertex_by_layout(
+                        pristine_shape,
+                        int(sm['v_start'])+int(src_idx)*stride,
+                        int(manifest.get('bone_count') or 0),
+                        layout,
+                    )
+                except Exception:
+                    pass
+                source_items.append({
+                    'cp': cp_i,
+                    'sm_i': sm_i,
+                    'src': src,
+                    'pos': tuple(map(float,native_pos)),
+                    'uv': tuple(map(float,native_uv)),
+                    'normal': tuple(map(float,native_normal)),
+                })
                 cp_i += 1
                 corner += 1
             tri_groups.append(sm_i)
+    if cp_map is not None and len(cp_map) == old_cp_count and len(vertex_src) != old_cp_count:
+        full_cp=[(int(item['sm_i']),int(item['src'][1])) for item in source_items]
+        drop=_duplicate_seam_face_drops(pristine_shape,manifest,full_cp)
+        if drop:
+            native_face_count=len(source_items)//3
+            source_items=[
+                dict(item)
+                for face_i in range(native_face_count) if face_i not in drop
+                for item in source_items[face_i*3:face_i*3+3]
+            ]
+            for target_cp,item in enumerate(source_items):
+                item['cp']=target_cp
+            vertex_src=[item['src'] for item in source_items]
+            tri_groups=[int(source_items[face_i*3]['sm_i']) for face_i in range(old_face_count)]
     if len(vertex_src) != old_cp_count or len(tri_groups) != old_face_count:
-        return False
+        report['mesh_patch']={
+            'status':'error: topology source map could not align with exported duplicate-seam filtering',
+            'native_polygon_vertices':len(vertex_src),
+            'expected_polygon_vertices':old_cp_count,
+            'native_faces':len(tri_groups),
+            'expected_faces':old_face_count,
+            'filtered_cp_map_vertices':len(cp_map) if cp_map is not None else None,
+        }
+        return True
 
     boundaries = [0]
     for i in range(1, len(tri_groups)):
@@ -1050,15 +1344,26 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
                 count += 1
         return (total / max(1, count), count)
 
-    insert_face = old_face_count
-    best_score = float('inf')
-    for candidate in boundaries[:-1]:
-        score, count = face_insert_score(candidate)
-        if count and (score < best_score - 0.01 or (abs(score - best_score) <= 0.01 and candidate < insert_face)):
-            best_score = score
-            insert_face = candidate
-    if best_score > 25.0:
+    inserted_by_new_control_points=[
+        face_i for face_i,face in enumerate(faces)
+        if any(int(cp) >= old_cp_count for cp in face)
+    ]
+    if (
+        len(inserted_by_new_control_points) == added_face_count
+        and inserted_by_new_control_points == list(range(inserted_by_new_control_points[0], inserted_by_new_control_points[0] + added_face_count))
+    ):
+        insert_face=inserted_by_new_control_points[0]
+        best_score=0.0
+    else:
         insert_face = old_face_count
+        best_score = float('inf')
+        for candidate in boundaries[:-1]:
+            score, count = face_insert_score(candidate)
+            if count and (score < best_score - 0.01 or (abs(score - best_score) <= 0.01 and candidate < insert_face)):
+                best_score = score
+                insert_face = candidate
+        if best_score > 25.0:
+            insert_face = old_face_count
 
     new_faces = faces[insert_face:insert_face + added_face_count]
     if not new_faces:
@@ -1124,14 +1429,52 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
                 best_d = d
         return best
 
+    def duplicated_face_source_group(new_face):
+        permutations=((0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0))
+        new_pos=[payload_vertices[cp] for cp in new_face]
+        new_uv=[payload_uvs[cp] if cp < len(payload_uvs) else (0.0,0.0) for cp in new_face]
+        new_normal=[payload_normals[cp] if cp < len(payload_normals) else (0.0,0.0,1.0) for cp in new_face]
+        new_center=tuple(sum(p[axis] for p in new_pos)/3.0 for axis in range(3))
+        best=None
+        for old_face_i in range(old_face_count):
+            edited_face_i=old_face_i if old_face_i < insert_face else old_face_i + added_face_count
+            if edited_face_i < 0 or edited_face_i >= len(faces):
+                continue
+            old_face=faces[edited_face_i]
+            old_pos=[payload_vertices[cp] for cp in old_face]
+            old_uv=[payload_uvs[cp] if cp < len(payload_uvs) else (0.0,0.0) for cp in old_face]
+            old_normal=[payload_normals[cp] if cp < len(payload_normals) else (0.0,0.0,1.0) for cp in old_face]
+            old_center=tuple(sum(p[axis] for p in old_pos)/3.0 for axis in range(3))
+            for order in permutations:
+                score=0.0
+                for new_corner,old_corner in enumerate(order):
+                    for axis in range(3):
+                        delta=(new_pos[new_corner][axis]-new_center[axis])-(old_pos[old_corner][axis]-old_center[axis])
+                        score += delta*delta
+                        normal_delta=float(new_normal[new_corner][axis])-float(old_normal[old_corner][axis])
+                        score += normal_delta*normal_delta
+                    du=float(new_uv[new_corner][0])-float(old_uv[old_corner][0])
+                    dv=float(new_uv[new_corner][1])-float(old_uv[old_corner][1])
+                    score += (du*du+dv*dv)*10000.0
+                if best is None or score < best[0]:
+                    best=(score,int(tri_groups[old_face_i]),old_face_i)
+        return best
+
     new_cp_ids = sorted({v for tri in new_faces for v in tri})
     group_votes = collections.Counter()
+    duplicate_face_matches={}
+    for face_offset,new_face in enumerate(new_faces):
+        matched=duplicated_face_source_group(new_face)
+        if matched is not None:
+            duplicate_face_matches[face_offset]=matched
+            group_votes[int(matched[1])] += len(new_face)
     nearest_by_new_cp = {}
-    for cp in new_cp_ids:
-        item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
-        if item:
-            nearest_by_new_cp[cp] = item
-            group_votes[int(item['sm_i'])] += 1
+    if not group_votes:
+        for cp in new_cp_ids:
+            item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+            if item:
+                nearest_by_new_cp[cp] = item
+                group_votes[int(item['sm_i'])] += 1
     if not group_votes:
         return False
     owner_group = group_votes.most_common(1)[0][0]
@@ -1153,16 +1496,21 @@ def patch_mesh_added_topology_editor_style(shape: bytearray, fbx: dict, manifest
     new_face_groups = []
     raw_new_face_groups = []
     for face_i in range(insert_face, insert_face + added_face_count):
-        face_votes = collections.Counter()
-        for cp in faces[face_i]:
-            item = nearest_by_new_cp.get(cp)
-            if item is None:
-                item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+        face_offset=face_i-insert_face
+        matched=duplicate_face_matches.get(face_offset)
+        if matched is not None:
+            raw_group=int(matched[1])
+        else:
+            face_votes = collections.Counter()
+            for cp in faces[face_i]:
+                item = nearest_by_new_cp.get(cp)
+                if item is None:
+                    item = nearest(source_items, payload_vertices[cp], payload_uvs[cp] if cp < len(payload_uvs) else None, payload_normals[cp] if cp < len(payload_normals) else None)
+                    if item is not None:
+                        nearest_by_new_cp[cp] = item
                 if item is not None:
-                    nearest_by_new_cp[cp] = item
-            if item is not None:
-                face_votes[int(item['sm_i'])] += 1
-        raw_group = face_votes.most_common(1)[0][0] if face_votes else owner_group
+                    face_votes[int(item['sm_i'])] += 1
+            raw_group = face_votes.most_common(1)[0][0] if face_votes else owner_group
         raw_new_face_groups.append(raw_group)
         try:
             raw_layout = str(submeshes[int(raw_group)]['layout'])
@@ -1603,51 +1951,381 @@ def patch_skeleton_from_fbx(shape: bytearray, extracted: Path, manifest: dict, r
     if old and sha256_file(fbx_path)==old and not patch_unchanged:
         report['skeleton_patch']={'status':'unchanged_not_patched'}; return
     fbx=extract_fbx_mesh(fbx_path)
-    records=parse_skeleton_records(bytes(shape))
+    records=parse_skeleton_records(bytes(shape), manifest)
     # Flexible name map: exact, space->underscore, trailing clean names.
     models=fbx['bone_models']
     fbx_export_scale=float(manifest.get('fbx_export_scale') or 1.0)
     if abs(fbx_export_scale) < 1e-8:
         fbx_export_scale=1.0
-    patched=0; missing=[]
+    matched={}
+    missing=[]
     for idx,r in records.items():
+        cand=find_bdg_bone_model(models, r['name'])
+        if cand:
+            matched[idx]=cand
+        else:
+            missing.append(r['name'])
+    children=collections.defaultdict(list)
+    for idx,r in records.items():
+        parent=int(r.get('parent', -1))
+        if parent >= 0:
+            children[parent].append(idx)
+    locked_indices={idx for idx,r in records.items() if not matched.get(idx)}
+    # Blender reparents surviving children when an EditBone is deleted. Preserve
+    # their native rest records so that reparenting is not mistaken for a move,
+    # but only lock animation tracks for bones actually absent from the FBX.
+    preserved_indices=set(locked_indices)
+    stack=list(locked_indices)
+    while stack:
+        parent_idx=stack.pop()
+        for child_idx in children.get(parent_idx, []):
+            if child_idx not in preserved_indices:
+                preserved_indices.add(child_idx)
+                stack.append(child_idx)
+    patched=0; unchanged=[]; rotations_ignored=0
+    changed_bones=[]
+    normalized_baseline=manifest.get('fbx_bone_translation_baseline') or {}
+    translation_epsilon=1e-3
+    for idx,r in records.items():
+        if idx in preserved_indices:
+            continue
         name=r['name']
-        cand=models.get(name) or models.get(name.replace(' ','_'))
+        cand=matched.get(idx)
         if not cand:
-            # trailing match fallback
-            for k,v in models.items():
-                if k.endswith(name) or k.endswith(name.replace(' ','_')):
-                    cand=v; break
-        if not cand:
-            missing.append(name); continue
+            continue
         off=r['off']
         if cand.get('rotation_euler_xyz_deg'):
-            q=euler_xyz_degrees_to_quat(*cand['rotation_euler_xyz_deg'])
-            struct.pack_into('>4f', shape, off+16, *q)
+            rotations_ignored += 1
         if cand.get('translation'):
             tx,ty,tz=cand['translation']
-            struct.pack_into('>3f', shape, off+32, tx/fbx_export_scale, ty/fbx_export_scale, tz/fbx_export_scale)
-        patched += 1
-    report['skeleton_patch']={'status':'patched' if patched else 'skipped_no_matching_bones','bones_patched':patched,'bones_missing_from_fbx':missing[:20],'missing_count':len(missing),'fbx_export_scale':fbx_export_scale}
+            old_t=tuple(float(v) for v in r['t'])
+            baseline_t=find_bdg_bone_model(normalized_baseline, name)
+            if isinstance(baseline_t, (list, tuple)) and len(baseline_t) >= 3:
+                new_t=tuple(
+                    old_t[i] + ((tx,ty,tz)[i] - float(baseline_t[i])) / fbx_export_scale
+                    for i in range(3)
+                )
+            else:
+                new_t=(tx/fbx_export_scale, ty/fbx_export_scale, tz/fbx_export_scale)
+            if any(abs(new_t[i]-old_t[i]) > translation_epsilon for i in range(3)):
+                struct.pack_into('>3f', shape, off+32, *new_t)
+                patched += 1
+                changed_bones.append({
+                    'idx': idx,
+                    'name': name,
+                    'old_local_translation': old_t,
+                    'new_local_translation': new_t,
+                })
+            else:
+                unchanged.append(name)
+    report['skeleton_patch']={
+        'status':'patched' if patched else 'skipped_no_changed_bone_positions',
+        'position_bones_patched':patched,
+        'changed_bones':changed_bones,
+        'deleted_or_missing_bones_preserved':missing[:20],
+        'deleted_or_missing_count':len(missing),
+        'deleted_or_missing_bone_indices':sorted(int(i) for i in locked_indices),
+        'deleted_descendant_bones_preserved':len(preserved_indices)-len(locked_indices),
+        'unchanged_bones_seen':len(unchanged),
+        'rotation_values_seen_but_preserved':rotations_ignored,
+        'fbx_export_scale':fbx_export_scale,
+        'lock_rule':'delete a bone node from the edited FBX to preserve that BDG skeleton record',
+        'writeback_scope':'local translation only; animations and rest rotations are preserved',
+    }
 
-def raw_anims_changed(extracted: Path, manifest: dict, name: str) -> bool:
+def patch_type4_skeleton_pose(data: bytearray, report: dict, stream_name: str):
+    skel=report.get('skeleton_patch') or {}
+    changed=skel.get('changed_bones') or []
+    if not changed:
+        report.setdefault('type4_skeleton_patches', []).append({'stream':stream_name,'status':'skipped_no_changed_bones'})
+        return
+    try:
+        _parser, entries=_bundle_entries_from_bytes(bytes(data))
+    except Exception as e:
+        report.setdefault('type4_skeleton_patches', []).append({'stream':stream_name,'status':f'skipped_parse_error: {type(e).__name__}: {e}'})
+        return
+
+    changed_by_idx={int(b['idx']):b for b in changed if 'idx' in b}
+    patches=[]
+    for e in entries:
+        name=str(e.get('name') or '')
+        lname=name.lower()
+        if e.get('is_resource') or int(e.get('file_type', -1)) != 4:
+            continue
+        if 'skeleton' not in lname or 'intro_cam' in lname or 'camera' in lname:
+            continue
+        base=int(e['offset']); size=int(e['size'])
+        if base < 0 or size < 0 or base + size > len(data) or size < 0x38:
+            continue
+        try:
+            count=struct.unpack_from('>I', data, base+0x2c)[0]
+        except Exception:
+            continue
+        if count <= 0 or count > 512 or 0x38 + count*4 > size:
+            continue
+        patched=[]
+        for bone_idx,bone in changed_by_idx.items():
+            if bone_idx < 0 or bone_idx >= count:
+                continue
+            try:
+                rec_rel=struct.unpack_from('>I', data, base+0x38+bone_idx*4)[0]
+                rec=base+rec_rel
+                if rec < base or rec + 0x24 > base + size:
+                    continue
+                rec_idx=struct.unpack_from('>i', data, rec)[0]
+                trans_rel=struct.unpack_from('>I', data, rec+0x1c)[0]
+                trans=rec + trans_rel
+                if rec_idx != bone_idx or trans < base or trans + 12 > base + size:
+                    continue
+                old_t=tuple(float(v) for v in bone.get('old_local_translation', ()))
+                new_t=tuple(float(v) for v in bone.get('new_local_translation', ()))
+                if len(old_t) != 3 or len(new_t) != 3:
+                    continue
+                cur=struct.unpack_from('>3f', data, trans)
+                if any(abs(float(cur[i])-old_t[i]) > 0.05 for i in range(3)):
+                    patched.append({
+                        'idx':bone_idx,
+                        'name':bone.get('name',''),
+                        'status':'skipped_current_translation_mismatch',
+                        'offset':hex(trans-base),
+                        'current':cur,
+                        'expected_old':old_t,
+                    })
+                    continue
+                struct.pack_into('>3f', data, trans, *new_t)
+                patched.append({
+                    'idx':bone_idx,
+                    'name':bone.get('name',''),
+                    'status':'patched',
+                    'offset':hex(trans-base),
+                    'old_local_translation':old_t,
+                    'new_local_translation':new_t,
+                })
+            except Exception as ex:
+                patched.append({'idx':bone_idx,'name':bone.get('name',''),'status':f'error: {type(ex).__name__}: {ex}'})
+        if patched:
+            patches.append({'stream':stream_name,'resource':name,'resource_offset':hex(base),'bone_count':count,'bones':patched})
+    if patches:
+        report.setdefault('type4_skeleton_patches', []).extend(patches)
+    else:
+        report.setdefault('type4_skeleton_patches', []).append({'stream':stream_name,'status':'skipped_no_matching_type4_skeleton'})
+
+def _walk_type3_skeleton_records(data: bytes | bytearray, base: int, size: int, strings: list[str]):
+    records={}
+    end=base+size
+    root=base+0x40
+    def rec(off):
+        if off < base or off + 48 > end:
+            raise ValueError(f'Type 3 skeleton record is outside its resource: {off-base:#x}')
+        idx,parent,nchild,name_idx=struct.unpack_from('>4i', data, off)
+        if idx < 0 or idx > 4096 or parent < -1 or parent > 4096 or nchild < 0 or nchild > 512:
+            raise ValueError(f'Invalid Type 3 skeleton record at {off-base:#x}')
+        if off + 48 + nchild*4 > end:
+            raise ValueError(f'Type 3 child table is outside its resource at {off-base:#x}')
+        q=struct.unpack_from('>4f', data, off+16)
+        t=struct.unpack_from('>3f', data, off+32)
+        child_rels=struct.unpack_from('>'+('I'*nchild), data, off+48) if nchild else ()
+        name=strings[name_idx] if 0 <= name_idx < len(strings) else ''
+        return {'idx':idx,'parent':parent,'nchild':nchild,'name_idx':name_idx,'name':name,'q':q,'t':t,'off':off,'children':[base+c for c in child_rels]}
+    def walk(off):
+        if off in {r['off'] for r in records.values()}:
+            return
+        r=rec(off)
+        if r['idx'] in records:
+            return
+        records[r['idx']]=r
+        for c in r['children']:
+            if base <= c and c+48 <= end:
+                walk(c)
+    walk(root)
+    return records
+
+def patch_type3_skeleton_from_report(data: bytearray, report: dict, stream_name: str):
+    skel=report.get('skeleton_patch') or {}
+    changed=skel.get('changed_bones') or []
+    if not changed:
+        report.setdefault('type3_skeleton_patches', []).append({'stream':stream_name,'status':'skipped_no_changed_bones'})
+        return
+    try:
+        parser, entries=_bundle_entries_from_bytes(bytes(data))
+        strings=parse_shapes_string_table(bytes(data), int(parser.string_offset))
+    except Exception as e:
+        report.setdefault('type3_skeleton_patches', []).append({'stream':stream_name,'status':f'skipped_parse_error: {type(e).__name__}: {e}'})
+        return
+    changed_by_idx={int(b['idx']):b for b in changed if 'idx' in b}
+    patches=[]
+    for e in entries:
+        name=str(e.get('name') or '')
+        lname=name.lower()
+        if e.get('is_resource') or int(e.get('file_type', -1)) != 3:
+            continue
+        if 'skeleton' not in lname or 'intro_cam' in lname or 'camera' in lname:
+            continue
+        base=int(e['offset']); size=int(e['size'])
+        if base < 0 or size < 0 or base + size > len(data) or size < 0x80:
+            continue
+        try:
+            records=_walk_type3_skeleton_records(data, base, size, strings)
+        except Exception:
+            continue
+        patched=[]
+        for bone_idx,bone in changed_by_idx.items():
+            r=records.get(bone_idx)
+            if not r:
+                continue
+            old_t=tuple(float(v) for v in bone.get('old_local_translation', ()))
+            new_t=tuple(float(v) for v in bone.get('new_local_translation', ()))
+            if len(old_t) != 3 or len(new_t) != 3:
+                continue
+            cur=tuple(float(v) for v in r['t'])
+            if all(abs(cur[i]-new_t[i]) <= 0.0005 for i in range(3)):
+                patched.append({'idx':bone_idx,'name':bone.get('name',''),'status':'already_patched','offset':hex(r['off']-base)})
+                continue
+            if any(abs(cur[i]-old_t[i]) > 0.05 for i in range(3)):
+                patched.append({
+                    'idx':bone_idx,
+                    'name':bone.get('name',''),
+                    'status':'skipped_current_translation_mismatch',
+                    'offset':hex(r['off']-base),
+                    'current':cur,
+                    'expected_old':old_t,
+                })
+                continue
+            struct.pack_into('>3f', data, r['off']+32, *new_t)
+            patched.append({
+                'idx':bone_idx,
+                'name':bone.get('name',''),
+                'status':'patched',
+                'offset':hex(r['off']-base),
+                'old_local_translation':old_t,
+                'new_local_translation':new_t,
+            })
+        if patched:
+            patches.append({'stream':stream_name,'resource':name,'resource_offset':hex(base),'bones':patched})
+    if patches:
+        report.setdefault('type3_skeleton_patches', []).extend(patches)
+    else:
+        report.setdefault('type3_skeleton_patches', []).append({'stream':stream_name,'status':'skipped_no_matching_type3_skeleton'})
+
+def raw_anims_changed(extracted: Path, manifest: dict, filename: str) -> bool:
     hashes=manifest.get('file_hashes') or {}
-    rel=f'animations_raw/{name}.bin'
+    rel=f'animations_raw/{filename}'
     p=extracted/rel
     if not p.exists(): return False
     old=hashes.get(rel)
     if not old: return True
     return sha256_file(p) != old
 
+def quat_xyz_to_i16(q):
+    return tuple(max(-32767, min(32767, int(round(float(v) * 32767.0)))) for v in q[:3])
+
+def patch_native_track_rotation(payload: bytearray, resource_abs: int, track: dict, xyz: tuple[int, int, int]) -> int:
+    rel=parse_int_maybe_hex(track.get('track_rel', 0))
+    count=int(track.get('record_count') or 0)
+    layout=str(track.get('layout') or '')
+    changed=0
+    if layout == 'explicit_qxyz_time':
+        for i in range(count):
+            off=resource_abs + rel + 4 + i*8
+            if off + 6 > len(payload):
+                break
+            struct.pack_into('>hhh', payload, off, *xyz)
+            changed += 1
+    elif layout == 'continuation_time_qxyz':
+        for i in range(count):
+            off=resource_abs + rel + i*8 + 2
+            if off + 6 > len(payload):
+                break
+            struct.pack_into('>hhh', payload, off, *xyz)
+            changed += 1
+    elif layout == 'first_qxyz_then_time_qxyz':
+        first=resource_abs + rel + 4
+        if first + 6 <= len(payload):
+            struct.pack_into('>hhh', payload, first, *xyz)
+            changed += 1
+        for i in range(1,count):
+            off=resource_abs + rel + 10 + (i-1)*8 + 2
+            if off + 6 > len(payload):
+                break
+            struct.pack_into('>hhh', payload, off, *xyz)
+            changed += 1
+    return changed
+
+def patch_deleted_bone_animation_locks(anim: bytearray, extracted: Path, manifest: dict, report: dict):
+    skeleton_report=report.get('skeleton_patch') or {}
+    locked={int(i) for i in skeleton_report.get('deleted_or_missing_bone_indices') or []}
+    if not locked:
+        report['animation_resource_patches'].append({'status':'skipped_no_deleted_bone_locks'})
+        return
+    if not anim:
+        report['animation_resource_patches'].append({'status':'skipped_deleted_bone_locks_no_animation_bdg','locked_bones':sorted(locked)})
+        return
+    tracks_by_rid={}
+    for res in manifest.get('animation_resource_locations', []):
+        tracks=res.get('native_rotation_tracks')
+        if tracks is not None:
+            rid=int(res.get('resource_id', -1))
+            tracks_by_rid[rid]={
+                'resource_id':rid,
+                'name':res.get('name'),
+                'tracks':tracks,
+            }
+
+    # Legacy exports stored this metadata in animations_raw. Continue accepting
+    # those projects, but new exports keep the required layout data in the log.
+    native_path=extracted/'animations_raw'/'animation_native_tracks_v11.json'
+    raw_native=[]
+    if not tracks_by_rid and native_path.exists():
+        try:
+            raw_native=json.loads(native_path.read_text(encoding='utf-8'))
+        except Exception:
+            raw_native=[]
+    if not tracks_by_rid and not raw_native:
+        report['animation_resource_patches'].append({'status':'skipped_deleted_bone_locks_no_native_track_manifest','locked_bones':sorted(locked)})
+        return
+    for clip in raw_native:
+        rid=int(clip.get('resource_id', -1))
+        tracks_by_rid[rid]=clip
+    bones={int(b['idx']):b for b in manifest.get('bones', []) if 'idx' in b}
+    total_tracks=0; total_records=0; clips=[]
+    for res in manifest.get('animation_resource_locations', []):
+        rid=int(res.get('resource_id', -1))
+        native=tracks_by_rid.get(rid)
+        if not native:
+            continue
+        resource_abs=parse_int_maybe_hex(res.get('absolute_offset', 0))
+        clip_report={'clip':res.get('name') or native.get('name'), 'resource_id':rid, 'tracks':[]}
+        for tr in native.get('tracks', []):
+            bone_id=int(tr.get('bone_id', -1))
+            if bone_id not in locked or bone_id not in bones:
+                continue
+            xyz=quat_xyz_to_i16(bones[bone_id].get('native_local_quaternion_xyzw', bones[bone_id].get('local_quaternion_xyzw', (0,0,0,1))))
+            changed=patch_native_track_rotation(anim, resource_abs, tr, xyz)
+            if changed:
+                total_tracks += 1
+                total_records += changed
+                clip_report['tracks'].append({'bone_id':bone_id,'bone_name':tr.get('bone_name'),'records_patched':changed,'rest_xyz_i16':list(xyz)})
+        if clip_report['tracks']:
+            clip_report['status']='patched_deleted_bone_locks'
+            clips.append(clip_report)
+    report['animation_resource_patches'].append({
+        'status':'patched_deleted_bone_locks' if total_tracks else 'skipped_no_matching_deleted_bone_tracks',
+        'locked_bones':sorted(locked),
+        'tracks_patched':total_tracks,
+        'records_patched':total_records,
+        'clips':clips[:20],
+    })
+
 def patch_raw_anims(anim: bytearray, extracted: Path, manifest: dict, report: dict, patch_unchanged=False):
     raw_dir=extracted/'animations_raw'
     if not raw_dir.exists():
         report['animation_resource_patches'].append({'status':'skipped_no_animations_raw_folder'}); return
     for res in manifest.get('animation_resource_locations', []):
-        raw=raw_dir/f"{res['name']}.bin"
+        filename=res.get('safe_filename') or f"{res['name']}.bin"
+        raw=raw_dir/filename
         if not raw.exists():
             report['animation_resource_patches'].append({'clip':res['name'],'status':'skipped_missing_raw_bin'}); continue
-        if not patch_unchanged and not raw_anims_changed(extracted,manifest,res['name']):
+        if not patch_unchanged and not raw_anims_changed(extracted,manifest,filename):
             report['animation_resource_patches'].append({'clip':res['name'],'status':'unchanged_not_patched'}); continue
         payload=raw.read_bytes(); expected=int(res['size']); off=parse_int_maybe_hex(res['absolute_offset'])
         if len(payload)!=expected:
@@ -1665,6 +2343,7 @@ def main() -> int:
     ap.add_argument('--patch-unchanged', action='store_true', help='Patch even files that match extraction hashes')
     ap.add_argument('--no-textures', action='store_true', help='Do not import PNG textures')
     ap.add_argument('--no-fbx', action='store_true', help='Do not import FBX mesh/skeleton rest-pose edits')
+    ap.add_argument('--no-action-anims', action='store_true', help='Do not import edited FBX Actions into Type 4 animations')
     ap.add_argument('--no-raw-anims', action='store_true', help='Do not import same-size animations_raw/*.bin swaps')
     args=ap.parse_args()
 
@@ -1678,10 +2357,12 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    shape_src=find_case_insensitive(root, manifest.get('source',''))
-    anim_src=find_case_insensitive(root, manifest.get('animation_source',''))
+    shape_name=manifest.get('source') or manifest.get('source_shapes') or ''
+    anim_name=manifest.get('animation_source') or manifest.get('source_anim') or ''
+    shape_src=find_case_insensitive(root, shape_name)
+    anim_src=find_case_insensitive(root, anim_name)
     if shape_src is None or anim_src is None:
-        raise SystemExit(f'Missing original BDGs beside Import.bat: {manifest.get("source")}, {manifest.get("animation_source")}')
+        raise SystemExit(f'Missing original BDGs beside Import.bat: {shape_name}, {anim_name}')
     staged_shape=out/shape_src.name; staged_anim=out/anim_src.name
     shutil.copy2(shape_src, staged_shape); shutil.copy2(anim_src, staged_anim)
     staged_pvms=[]
@@ -1699,7 +2380,8 @@ def main() -> int:
         'limits': [
             'Requires same FBX polygon order/topology as the extracted mesh for mesh writeback.',
             'Skin64 vertices can store only two influences; blend76 vertices can store only four. Extra FBX weights are reduced to source format limits and reported.',
-            'Blender animation curves are not yet re-encoded to proprietary BDG animation channels; use animations_raw same-size binary replacement for now.',
+            'Changed BDG skeleton local positions import from FBX bone nodes; deleted/missing bone nodes preserve the original skeleton record.',
+            'Edited FBX Actions are rebuilt as native Type 4 clips when the extraction contains an Action baseline.',
             'PVM files are copied/preserved; this Godzilla profile stores the decoded texture payloads in Shapes.BDG.',
         ],
     }
@@ -1716,10 +2398,22 @@ def main() -> int:
                 report['mesh_patch']={'status':f'error: {type(e).__name__}: {e}'}
             try:
                 patch_skeleton_from_fbx(shape, extracted, manifest, report, patch_unchanged=args.patch_unchanged)
+                if not args.no_action_anims and manifest.get('animation_action_baseline'):
+                    from bdg_animation_import import import_bdg_actions
+                    fbx_path=extracted / manifest.get('fbx','Godzilla2K.fbx')
+                    anim, _action_results=import_bdg_actions(bytes(anim), fbx_path, manifest, report)
+                    anim=bytearray(anim)
+                elif not args.no_action_anims:
+                    report['animation_action_import']=[{'status':'skipped_missing_action_baseline'}]
+                patch_type3_skeleton_from_report(anim, report, 'animation')
+                patch_type4_skeleton_pose(shape, report, 'shapes')
+                patch_type4_skeleton_pose(anim, report, 'animation')
+                patch_mesh_for_skeleton_position_edits(shape, manifest, report)
             except Exception as e:
                 report['skeleton_patch']={'status':f'error: {type(e).__name__}: {e}'}
         if not args.no_raw_anims:
             patch_raw_anims(anim, extracted, manifest, report, patch_unchanged=args.patch_unchanged)
+            patch_deleted_bone_animation_locks(anim, extracted, manifest, report)
         staged_shape.write_bytes(shape)
         staged_anim.write_bytes(anim)
 

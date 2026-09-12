@@ -726,7 +726,16 @@ def _template_records_by_primary_index(D: bytes, sm: dict, index_width: int) -> 
     return out
 
 
-def _patch_native_vertex_record(record: bytearray, layout: str, pos, normal=None, uv=None, weights=None) -> bytes:
+def _patch_native_vertex_record(
+    record: bytearray,
+    layout: str,
+    pos,
+    normal=None,
+    uv=None,
+    weights=None,
+    tangent=None,
+    bitangent=None,
+) -> bytes:
     struct.pack_into('>3f', record, 0, float(pos[0]), float(pos[1]), float(pos[2]))
     if normal is not None:
         try:
@@ -750,6 +759,16 @@ def _patch_native_vertex_record(record: bytearray, layout: str, pos, normal=None
                 struct.pack_into('>2f', record, 44, float(uv[0]), float(uv[1]))
             elif layout in ('skin48', 'skin40'):
                 struct.pack_into('>2f', record, 32, float(uv[0]), float(uv[1]))
+        except Exception:
+            pass
+    if tangent is not None and bitangent is not None:
+        try:
+            if layout == 'skin64':
+                struct.pack_into('>3f', record, 40, *map(float, tangent))
+                struct.pack_into('>3f', record, 52, *map(float, bitangent))
+            elif layout == 'blend76':
+                struct.pack_into('>3f', record, 52, *map(float, tangent))
+                struct.pack_into('>3f', record, 64, *map(float, bitangent))
         except Exception:
             pass
     if weights:
@@ -1127,6 +1146,11 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
             old_rel = _u32(original, toc + 10, endian)
             _p32(out, toc + 10, old_rel + total_delta, endian)
 
+    # Header 0x74 owns the complete resource-data section size. The parser can
+    # reload files without it, but the game uses this boundary when the mesh
+    # resource grows.
+    _p32(out, 0x74, len(out) - int(parser.resource_data_offset), endian)
+
     # Patch descriptors.  Offsets shift when they live after the replaced DL gap
     # and again when they live after the appended vertex records.
     new_record_count = len(appended_local_tris) * 3
@@ -1171,6 +1195,8 @@ def _save_added_topology_grow_v19(shape_path: str | Path, payload: dict[str, Any
         new_descs_for_validation.append(nd)
 
     cand = bytes(out)
+    if _u32(cand, 0x74, endian) != len(cand) - int(parser.resource_data_offset):
+        raise ValueError('BDG header 0x74 does not match the grown resource-section size')
 
     ok_resources, resource_msg = _validate_non_mesh_resources_preserved(
         original, cand, entries, mesh_entry, total_delta

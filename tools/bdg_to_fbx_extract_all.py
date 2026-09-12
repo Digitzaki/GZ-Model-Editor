@@ -8,6 +8,7 @@ for _p in (TOOL_DIR, ROOT_DIR):
 from decode_cmpr import decode_cmpr
 from wii_tex_decode import decode_rgb565, decode_i8, decode_ia4, decode_ia8, decode_rgb5a3
 from parser_core import PipeworksParser
+from bdg_animations import decode_bdg_animations
 
 CMD_QUADS=0x80; CMD_TRIS=0x90; CMD_TRI_STRIP=0x98; CMD_TRI_FAN=0xA0
 VALID_DL={CMD_QUADS,CMD_TRIS,CMD_TRI_STRIP,CMD_TRI_FAN}
@@ -78,7 +79,7 @@ def find_strtab(D):
             ze=D.find(b'\0',so,min(len(D),so+240))
             if ze<0: break
             raw=D[so:ze]
-            if len(raw)<=180 and all(32<=b<127 for b in raw):
+            if len(raw)<=180 and all(32<=b<127 or b in (9,10,13) for b in raw):
                 strings.append(raw.decode('latin1')); ok+=1
             else: strings.append('')
         if ok>=cnt*0.75:
@@ -151,6 +152,12 @@ def col_local(r):
 
 def fbx_matrix_from_col(m):
     return [m[0][0],m[1][0],m[2][0],0, m[0][1],m[1][1],m[2][1],0, m[0][2],m[1][2],m[2][2],0, m[0][3],m[1][3],m[2][3],1]
+
+def invert_rigid_col(m):
+    r=[[m[j][i] for j in range(3)] for i in range(3)]
+    t=[m[i][3] for i in range(3)]
+    it=[-sum(r[i][j]*t[j] for j in range(3)) for i in range(3)]
+    return [[r[0][0],r[0][1],r[0][2],it[0]],[r[1][0],r[1][1],r[1][2],it[1]],[r[2][0],r[2][1],r[2][2],it[2]],[0,0,0,1]]
 
 def quat_to_euler_xyz_degrees(q):
     x,y,z,w=q
@@ -501,11 +508,20 @@ def texture_entries(D):
                 entries.append({'rid':rid,'rel':rel,'size':size,'abs':data_base+rel,'type':typ,'name':f'texture_rid_{rid}'})
     return entries,data_base
 
-def decode_textures(D,strings,outdir,asset_name):
+def decode_textures(D,strings,outdir,asset_name,material_names=None):
     texdir=outdir/'textures'; texdir.mkdir(parents=True,exist_ok=True)
     entries,data_base=texture_entries(D)
     specs=[]
     used=set()
+    material_names=list(material_names or [f'{asset_name}_Material'])
+
+    def material_index_for_hint(hint):
+        hint=str(hint or '').upper()
+        if hint:
+            for index,name in enumerate(material_names):
+                if hint in str(name).upper():
+                    return index
+        return 0
 
     def named_entry(token):
         token=token.upper()
@@ -540,31 +556,33 @@ def decode_textures(D,strings,outdir,asset_name):
             return 'I8',256,256
         return None,0,0
 
-    def add_named(token,suffix,prop=None):
+    def add_named(token,suffix,prop=None,material_hint=None):
         e=named_entry(token)
         if not e:
             return
         fmt,w,h = format_from_entry(e)
         if not fmt or not w or not h:
             return
-        specs.append((suffix,fmt,e,w,h,prop))
+        specs.append((suffix,fmt,e,w,h,prop,material_index_for_hint(material_hint)))
 
     add_named('_512_C','C','DiffuseColor')
     add_named('_512_B','B',None)
     add_named('_512_S','S','SpecularColor')
     add_named('_256_M','M',None)
+    add_named('SHARDS_64_C','Shards_C','DiffuseColor','SHARDS')
+    add_named('CUBEMAP','Cubemap',None,'SHARDS')
 
     if not specs:
         # Fallback order for bundles without texture names.
         cmpr=[e for e in entries if e['size']==0x2aac0]
         rgb=[e for e in entries if e['size']==0xaaaa0]
         i8=[e for e in entries if e['size'] in (0x15560,0x15600)]
-        if cmpr: specs.append(('C','CMPR',cmpr[0],512,512,'DiffuseColor'))
-        if rgb: specs.append(('B','RGB565',rgb[0],512,512,None))
-        if len(cmpr)>1: specs.append(('S','CMPR',cmpr[1],512,512,'SpecularColor'))
-        if i8: specs.append(('M','I8',i8[-1],256,256,None))
+        if cmpr: specs.append(('C','CMPR',cmpr[0],512,512,'DiffuseColor',0))
+        if rgb: specs.append(('B','RGB565',rgb[0],512,512,None,0))
+        if len(cmpr)>1: specs.append(('S','CMPR',cmpr[1],512,512,'SpecularColor',0))
+        if i8: specs.append(('M','I8',i8[-1],256,256,None,0))
     tex_manifest=[]; bindings=[]
-    for suffix,fmt,e,w,h,prop in specs:
+    for suffix,fmt,e,w,h,prop,material_index in specs:
         raw=D[e['abs']:]
         try:
             if fmt=='CMPR': img=decode_cmpr(raw[:w*h//2],w,h)
@@ -574,8 +592,8 @@ def decode_textures(D,strings,outdir,asset_name):
             elif fmt=='IA8': img=decode_ia8(raw[:w*h*2],w,h)
             else: img=decode_i8(raw[:w*h],w,h)
             fn=f'{asset_name}_{suffix}.png'; img.save(texdir/fn)
-            tex_manifest.append({'file':fn,'name':e.get('name'),'format':fmt,'rid':e['rid'],'rel':hex(e['rel']),'size':hex(e['size']),'width':w,'height':h})
-            if prop: bindings.append((asset_name+'_'+suffix,f'textures/{fn}',prop))
+            tex_manifest.append({'file':fn,'name':e.get('name'),'format':fmt,'rid':e['rid'],'rel':hex(e['rel']),'size':hex(e['size']),'width':w,'height':h,'material_index':material_index})
+            if prop: bindings.append((asset_name+'_'+suffix,f'textures/{fn}',prop,material_index))
         except Exception as ex:
             tex_manifest.append({'suffix':suffix,'error':str(ex),'rid':e['rid'],'rel':hex(e['rel'])})
     # Blender normal map from raw B.
@@ -586,7 +604,7 @@ def decode_textures(D,strings,outdir,asset_name):
             for x in range(raw.width):
                 r,g,b,a=sp[x,y]; nx=r/255*2-1; ny=g/255*2-1; nz=math.sqrt(max(0,1-min(1,nx*nx+ny*ny)))
                 dp[x,y]=(int((nx*.5+.5)*255+.5),int((-ny*.5+.5)*255+.5),int((nz*.5+.5)*255+.5),a)
-        nfn=f'{asset_name}_N.png'; normal.save(texdir/nfn); bindings.append((asset_name+'_N',f'textures/{nfn}','NormalMap'))
+        nfn=f'{asset_name}_N.png'; normal.save(texdir/nfn); bindings.append((asset_name+'_N',f'textures/{nfn}','NormalMap',0))
     return tex_manifest,bindings
 
 # -------- FBX writer classes --------
@@ -602,6 +620,7 @@ def PDouble(v): return Prop('D',float(v))
 def PBool(v): return Prop('C',bool(v))
 def PStr(v): return Prop('S',str(v))
 def PRaw(v): return Prop('R',bytes(v))
+def PObjectName(name, object_class): return PStr(f'{name}\x00\x01{object_class}')
 def ADouble(v): return Arr('d',v)
 def AInt(v): return Arr('i',v)
 def ALong(v): return Arr('l',v)
@@ -753,6 +772,40 @@ def sample_quat_keys(times,quats,duration,fps=60.0):
         else: out_q.append(q_slerp(q0,q1,(t-t0)/(t1-t0)))
     return sample_times,out_q
 
+def sample_vector_keys(times, values, duration, fps=60.0):
+    if not times or not values:
+        return [], []
+    duration=max(float(duration or 0.0), max(times) if times else 0.0)
+    pairs=sorted(zip(times,values), key=lambda item:item[0])
+    clean=[]
+    for time,value in pairs:
+        if not clean or time > clean[-1][0] + 1e-7:
+            clean.append((float(time), tuple(float(axis) for axis in value)))
+    if len(clean)==1 or duration <= 1e-6:
+        return [0.0,max(duration,1.0/fps)],[clean[0][1],clean[0][1]]
+    if clean[0][0] > 1e-7:
+        clean.insert(0,(0.0,clean[0][1]))
+    if clean[-1][0] < duration - 1e-7:
+        clean.append((duration,clean[-1][1]))
+    count=min(900,max(2,int(math.ceil(duration*fps))+1))
+    sample_times=[min(duration,index*duration/(count-1)) for index in range(count)]
+    sample_times=sorted(set([round(time,8) for time in sample_times]+[round(time,8) for time,_ in clean]))
+    result=[]; key_index=0
+    for time in sample_times:
+        while key_index+1<len(clean) and clean[key_index+1][0] < time-1e-7:
+            key_index+=1
+        if key_index+1>=len(clean):
+            result.append(clean[-1][1]); continue
+        left_time,left=clean[key_index]; right_time,right=clean[key_index+1]
+        if time <= left_time+1e-7:
+            result.append(left)
+        elif right_time <= left_time+1e-7:
+            result.append(right)
+        else:
+            amount=(time-left_time)/(right_time-left_time)
+            result.append(tuple(left[axis]+amount*(right[axis]-left[axis]) for axis in range(3)))
+    return sample_times,result
+
 def _triangle_uv_span(tri_uvs):
     if len(tri_uvs) != 3:
         return 0.0
@@ -763,7 +816,8 @@ def _triangle_uv_span(tri_uvs):
         best = max(best, math.sqrt(du * du + dv * dv))
     return best
 
-def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights):
+def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights, face_materials=None):
+    face_materials=list(face_materials or [0] * (len(vertices) // 3))
     groups = collections.defaultdict(list)
     face_count = len(vertices) // 3
     for fi in range(face_count):
@@ -786,7 +840,7 @@ def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights):
         for fi in range(face_count):
             base = fi * 3
             poly_indices.extend([base, base + 1, -base - 3])
-        return vertices, normals, uvs, vertex_weights, poly_indices, 0
+        return vertices, normals, uvs, vertex_weights, poly_indices, face_materials, 0
 
     drop = set()
     for rows in groups.values():
@@ -809,12 +863,13 @@ def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights):
         for fi in range(face_count):
             base = fi * 3
             poly_indices.extend([base, base + 1, -base - 3])
-        return vertices, normals, uvs, vertex_weights, poly_indices, 0
+        return vertices, normals, uvs, vertex_weights, poly_indices, face_materials, 0
 
     out_vertices = []
     out_normals = []
     out_uvs = []
     out_weights = []
+    out_materials = []
     out_poly = []
     for fi in range(face_count):
         if fi in drop:
@@ -825,8 +880,9 @@ def _filter_duplicate_seam_faces(vertices, normals, uvs, vertex_weights):
         out_normals.extend(normals[start:start + 3])
         out_uvs.extend(uvs[start:start + 3])
         out_weights.extend(vertex_weights[start:start + 3])
+        out_materials.append(face_materials[fi] if fi < len(face_materials) else 0)
         out_poly.extend([base, base + 1, -base - 3])
-    return out_vertices, out_normals, out_uvs, out_weights, out_poly, len(drop)
+    return out_vertices, out_normals, out_uvs, out_weights, out_poly, out_materials, len(drop)
 
 
 
@@ -988,7 +1044,6 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
             if len(ids)>=4 and all(ids[i]+1==ids[i+1] for i in range(len(ids)-1)): return rel
         return None
     decoded=[]; raw_entries=[]
-    rawdir=outdir/'animations_raw'; rawdir.mkdir(parents=True, exist_ok=True)
     for rid in range(3,res_count):
         name=res_name(rid)
         try:
@@ -1049,7 +1104,6 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
             if unique:
                 safe=re.sub(r'[^A-Za-z0-9_.-]+','_',name)[:120]
                 raw_payload=D[off:off+size]
-                (rawdir/f'{safe}.bin').write_bytes(raw_payload)
                 decoded.append({'rid':rid,'name':name,'duration':dur,'size':size,'rot_section_end':rot_end,'tracks':unique})
                 raw_entries.append({
                     'resource_id':rid,
@@ -1060,28 +1114,52 @@ def decode_animations(anim_path,bone_count,bone_names,skeleton,asset_hint,outdir
                     'size':size,
                     'duration_seconds':dur,
                     'sha256':hashlib.sha256(raw_payload).hexdigest(),
-                    'import_rule':'exact_raw_same_size_only'
+                    'import_rule':'exact_raw_same_size_only',
+                    'native_rotation_tracks':[
+                        {
+                            'bone_id':tr['bone'],
+                            'bone_name':bone_names[tr['bone']] if tr['bone'] < len(bone_names) else str(tr['bone']),
+                            'layout':tr['layout'],
+                            'track_rel':hex(tr['rel']),
+                            'record_count':tr['count'],
+                        }
+                        for tr in unique
+                    ],
                 })
         except Exception:
             continue
-
-    # Native track dump for animation decode debugging.
-    native_dump=[]
-    for a in decoded:
-        native_dump.append({
-            'resource_id':a['rid'], 'name':a['name'], 'duration':a['duration'],
-            'rotation_section_end':hex(a['rot_section_end']),
-            'tracks':[{'bone_id':tr['bone'], 'bone_name':bone_names[tr['bone']] if tr['bone'] < len(bone_names) else str(tr['bone']),
-                       'layout':tr['layout'], 'track_rel':hex(tr['rel']), 'record_count':tr['count'],
-                       'records':[k[2] for k in tr['keys']]} for tr in a['tracks']]
-        })
-    (rawdir/'animation_native_tracks_v11.json').write_text(json.dumps(native_dump, indent=2))
     return decoded, raw_entries
 
-def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,animations):
+def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,animations,material_names=None,face_materials=None):
     BONE_COUNT=len(bone_names)
+    animations=list(animations)
+    preferred_action=next((i for i,a in enumerate(animations) if str(a.get('name','')).upper().endswith('_IDLE_PASSIVE')),None)
+    if preferred_action is None:
+        preferred_action=next((i for i,a in enumerate(animations) if str(a.get('name','')).upper().endswith('_IDLE')),None)
+    if preferred_action not in (None,0):
+        animations.insert(0,animations.pop(preferred_action))
+    if animations and BONE_COUNT:
+        rest_tracks=[]
+        for bone in range(BONE_COUNT):
+            rest=skeleton[bone]
+            rest_tracks.append({
+                'bone':bone,
+                'translation_keys':[(0.0,tuple(float(v)*BDG_FBX_EXPORT_SCALE for v in rest['t']))],
+                'rotation_keys':[(0.0,tuple(float(v) for v in rest['q']))],
+            })
+        animations.insert(0,{
+            'resource_id':None,
+            'name':'000_REST_POSE',
+            'duration':1.0/60.0,
+            'tracks':rest_tracks,
+            '_synthetic_rest':True,
+        })
     BASE_ID=(int(hashlib.sha1(asset.encode('utf-8')).hexdigest()[:8],16)%1000000000) + 2000000000
-    GEOM_ID=BASE_ID+1; MODEL_ID=BASE_ID+2; MAT_ID=BASE_ID+3; SKIN_ID=BASE_ID+4; POSE_ID=BASE_ID+5; TEX_ID_BASE=BASE_ID+100; VID_ID_BASE=BASE_ID+200; BONE_MODEL_BASE=BASE_ID+1000; BONE_ATTR_BASE=BASE_ID+2000; CLUSTER_BASE=BASE_ID+3000; ANIM_ID_BASE=BASE_ID+1000000
+    GROUP_ID=BASE_ID; GEOM_ID=BASE_ID+1; MODEL_ID=BASE_ID+2; SKIN_ID=BASE_ID+4; POSE_ID=BASE_ID+5; MAT_ID=BASE_ID+10; TEX_ID_BASE=BASE_ID+100; VID_ID_BASE=BASE_ID+200; BONE_MODEL_BASE=BASE_ID+1000; BONE_ATTR_BASE=BASE_ID+2000; CLUSTER_BASE=BASE_ID+3000; ANIM_ID_BASE=BASE_ID+1000000
+    material_names=list(material_names or [f'{asset}_Material'])
+    face_materials=[max(0,min(len(material_names)-1,int(value))) for value in (face_materials or [])]
+    material_mapping='ByPolygon' if len(material_names)>1 and face_materials else 'AllSame'
+    material_values=face_materials if material_mapping=='ByPolygon' else [0]
     scaled_vertices=[(x*BDG_FBX_EXPORT_SCALE,y*BDG_FBX_EXPORT_SCALE,z*BDG_FBX_EXPORT_SCALE) for x,y,z in vertices]
     def scaled_matrix(m):
         out=[list(row) for row in m]
@@ -1089,30 +1167,33 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
         return out
     scaled_col_global={i:scaled_matrix(m) for i,m in col_global.items()}
     scaled_global_pos={i:(p[0]*BDG_FBX_EXPORT_SCALE,p[1]*BDG_FBX_EXPORT_SCALE,p[2]*BDG_FBX_EXPORT_SCALE) for i,p in global_pos.items()}
-    geometry=Node('Geometry',[PLong(GEOM_ID),PStr(f'Geometry::{asset}_Geometry'),PStr('Mesh')],[Node('Vertices',[ADouble(flat3(scaled_vertices))]),Node('PolygonVertexIndex',[AInt(poly_indices)]),Node('GeometryVersion',[PInt(124)]),Node('LayerElementNormal',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('Normals',[ADouble(flat3(normals))])]),Node('LayerElementUV',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('UVChannel_1')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('UV',[ADouble(flat2(uvs))])]),Node('LayerElementMaterial',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('AllSame')]),Node('ReferenceInformationType',[PStr('IndexToDirect')]),Node('Materials',[AInt([0])])]),Node('Layer',[PInt(0)],[Node('Version',[PInt(100)]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementNormal')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementUV')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementMaterial')]),Node('TypedIndex',[PInt(0)])])])])
-    mesh_model=Node('Model',[PLong(MODEL_ID),PStr(f'Model::{asset}'),PStr('Mesh')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',0.0,0.0,0.0),p_node('Lcl Rotation','Lcl Rotation','','A',0.0,0.0,0.0),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('DefaultAttributeIndex','int','Integer','',0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])])
-    material=Node('Material',[PLong(MAT_ID),PStr(f'Material::{asset}_Material'),PStr('')],[Node('Version',[PInt(102)]),Node('ShadingModel',[PStr('phong')]),Node('MultiLayer',[PInt(0)]),Node('Properties70',children=[p_node('DiffuseColor','Color','','A',0.8,0.8,0.8),p_node('SpecularColor','Color','','A',0.25,0.25,0.25),p_node('BumpFactor','double','Number','A',0.45)])])
+    geometry=Node('Geometry',[PLong(GEOM_ID),PObjectName(f'{asset}_Geometry','Geometry'),PStr('Mesh')],[Node('Vertices',[ADouble(flat3(scaled_vertices))]),Node('PolygonVertexIndex',[AInt(poly_indices)]),Node('GeometryVersion',[PInt(124)]),Node('LayerElementNormal',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('Normals',[ADouble(flat3(normals))])]),Node('LayerElementUV',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('UVChannel_1')]),Node('MappingInformationType',[PStr('ByPolygonVertex')]),Node('ReferenceInformationType',[PStr('Direct')]),Node('UV',[ADouble(flat2(uvs))])]),Node('LayerElementMaterial',[PInt(0)],[Node('Version',[PInt(101)]),Node('Name',[PStr('')]),Node('MappingInformationType',[PStr(material_mapping)]),Node('ReferenceInformationType',[PStr('IndexToDirect')]),Node('Materials',[AInt(material_values)])]),Node('Layer',[PInt(0)],[Node('Version',[PInt(100)]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementNormal')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementUV')]),Node('TypedIndex',[PInt(0)])]),Node('LayerElement',children=[Node('Type',[PStr('LayerElementMaterial')]),Node('TypedIndex',[PInt(0)])])])])
+    group_model=Node('Model',[PLong(GROUP_ID),PObjectName(f'{asset}_Armature','Model'),PStr('Null')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',0.0,0.0,0.0),p_node('Lcl Rotation','Lcl Rotation','','A',0.0,0.0,0.0),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])])
+    mesh_model=Node('Model',[PLong(MODEL_ID),PObjectName(asset,'Model'),PStr('Mesh')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',0.0,0.0,0.0),p_node('Lcl Rotation','Lcl Rotation','','A',0.0,0.0,0.0),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('DefaultAttributeIndex','int','Integer','',0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])])
+    materials=[Node('Material',[PLong(MAT_ID+i),PObjectName(name,'Material'),PStr('')],[Node('Version',[PInt(102)]),Node('ShadingModel',[PStr('phong')]),Node('MultiLayer',[PInt(0)]),Node('Properties70',children=[p_node('DiffuseColor','Color','','A',0.8,0.8,0.8),p_node('SpecularColor','Color','','A',0.25,0.25,0.25),p_node('BumpFactor','double','Number','A',0.45)])]) for i,name in enumerate(material_names)]
     texture_nodes=[]; video_nodes=[]
-    for i,(label,rel,prop) in enumerate(tex_bindings):
+    for i,(label,rel,prop,material_index) in enumerate(tex_bindings):
         tid=TEX_ID_BASE+i; vid=VID_ID_BASE+i; abs_file=str((outdir/rel).resolve())
         # Match the game's repeating texture wrap.
-        texture_nodes.append(Node('Texture',[PLong(tid),PStr(f'Texture::{label}'),PStr('')],[Node('Type',[PStr('TextureVideoClip')]),Node('Version',[PInt(202)]),Node('TextureName',[PStr(f'Texture::{label}')]),Node('Properties70',children=[p_node('WrapModeU','enum','','',0),p_node('WrapModeV','enum','','',0),p_node('UseMaterial','bool','','',1),p_node('UseMipMap','bool','','',1)]),Node('Media',[PStr(f'Video::{label}')]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)]),Node('ModelUVTranslation',[PDouble(0.0),PDouble(0.0)]),Node('ModelUVScaling',[PDouble(1.0),PDouble(1.0)]),Node('Texture_Alpha_Source',[PStr('None')]),Node('Cropping',[PInt(0),PInt(0),PInt(0),PInt(0)])]))
-        video_nodes.append(Node('Video',[PLong(vid),PStr(f'Video::{label}'),PStr('Clip')],[Node('Type',[PStr('Clip')]),Node('Properties70',children=[p_node('Path','KString','XRefUrl','',rel)]),Node('UseMipMap',[PInt(0)]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)])]))
+        texture_nodes.append(Node('Texture',[PLong(tid),PObjectName(label,'Texture'),PStr('')],[Node('Type',[PStr('TextureVideoClip')]),Node('Version',[PInt(202)]),Node('TextureName',[PStr(f'Texture::{label}')]),Node('Properties70',children=[p_node('WrapModeU','enum','','',0),p_node('WrapModeV','enum','','',0),p_node('UseMaterial','bool','','',1),p_node('UseMipMap','bool','','',1)]),Node('Media',[PStr(f'Video::{label}')]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)]),Node('ModelUVTranslation',[PDouble(0.0),PDouble(0.0)]),Node('ModelUVScaling',[PDouble(1.0),PDouble(1.0)]),Node('Texture_Alpha_Source',[PStr('None')]),Node('Cropping',[PInt(0),PInt(0),PInt(0),PInt(0)])]))
+        video_nodes.append(Node('Video',[PLong(vid),PObjectName(label,'Video'),PStr('Clip')],[Node('Type',[PStr('Clip')]),Node('Properties70',children=[p_node('Path','KString','XRefUrl','',rel)]),Node('UseMipMap',[PInt(0)]),Node('FileName',[PStr(abs_file)]),Node('RelativeFilename',[PStr(rel)])]))
     bone_models=[]; bone_attrs=[]
     for i,name in enumerate(bone_names):
         r=skeleton[i]; tx,ty,tz=r['t']; tx*=BDG_FBX_EXPORT_SCALE; ty*=BDG_FBX_EXPORT_SCALE; tz*=BDG_FBX_EXPORT_SCALE; rx,ry,rz=quat_to_euler_xyz_degrees(r['q']); child_ids=[j for j,p in parent.items() if p==i]
         limb_len=max(0.5,dist(scaled_global_pos[child_ids[0]],scaled_global_pos[i])) if child_ids else 3.0*BDG_FBX_EXPORT_SCALE
-        bone_models.append(Node('Model',[PLong(BONE_MODEL_BASE+i),PStr(f'Model::{name}'),PStr('LimbNode')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',float(tx),float(ty),float(tz)),p_node('Lcl Rotation','Lcl Rotation','','A',float(rx),float(ry),float(rz)),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('RotationOrder','enum','','',0),p_node('LimbLength','double','Number','H',float(limb_len)),p_node('Size','double','Number','',1.0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])]))
+        bone_models.append(Node('Model',[PLong(BONE_MODEL_BASE+i),PObjectName(name,'Model'),PStr('LimbNode')],[Node('Version',[PInt(232)]),Node('Properties70',children=[p_node('Lcl Translation','Lcl Translation','','A',float(tx),float(ty),float(tz)),p_node('Lcl Rotation','Lcl Rotation','','A',float(rx),float(ry),float(rz)),p_node('Lcl Scaling','Lcl Scaling','','A',1.0,1.0,1.0),p_node('RotationOrder','enum','','',0),p_node('LimbLength','double','Number','H',float(limb_len)),p_node('Size','double','Number','',1.0)]),Node('Shading',[PBool(True)]),Node('Culling',[PStr('CullingOff')])]))
         bone_attrs.append(Node('NodeAttribute',[PLong(BONE_ATTR_BASE+i),PStr(f'NodeAttribute::{name}'),PStr('LimbNode')],[Node('TypeFlags',[PStr('Skeleton')]),Node('Properties70',children=[p_node('Size','double','Number','',1.0)])]))
     cluster_indices=collections.defaultdict(list); cluster_weights=collections.defaultdict(list)
     for vi,wts in enumerate(vertex_weights):
         for b,wt in wts:
             if 0<=b<BONE_COUNT and wt>1e-6: cluster_indices[b].append(vi); cluster_weights[b].append(float(wt))
-    skin=Node('Deformer',[PLong(SKIN_ID),PStr(f'Deformer::{asset}_Skin'),PStr('Skin')],[Node('Version',[PInt(101)]),Node('Link_DeformAcuracy',[PDouble(50.0)])])
+    skin=Node('Deformer',[PLong(SKIN_ID),PObjectName(f'{asset}_Skin','Deformer'),PStr('Skin')],[Node('Version',[PInt(101)]),Node('Link_DeformAcuracy',[PDouble(50.0)])])
     clusters=[]
     for i in range(BONE_COUNT):
-        clusters.append(Node('Deformer',[PLong(CLUSTER_BASE+i),PStr(f'SubDeformer::Cluster_{bone_names[i]}'),PStr('Cluster')],[Node('Version',[PInt(100)]),Node('UserData',[PStr(''),PStr('')]),Node('Indexes',[AInt(cluster_indices.get(i,[]))]),Node('Weights',[ADouble(cluster_weights.get(i,[]))]),Node('Transform',[ADouble(identity())]),Node('TransformLink',[ADouble(fbx_matrix_from_col(scaled_col_global[i]))])]))
-    pose_children=[Node('Type',[PStr('BindPose')]),Node('Version',[PInt(100)]),Node('NbPoseNodes',[PInt(BONE_COUNT+1)]),Node('PoseNode',children=[Node('Node',[PLong(MODEL_ID)]),Node('Matrix',[ADouble(identity())])])]
+        bone_bind=scaled_col_global[i]
+        mesh_in_bone_space=invert_rigid_col(bone_bind)
+        clusters.append(Node('Deformer',[PLong(CLUSTER_BASE+i),PObjectName(f'Cluster_{bone_names[i]}','SubDeformer'),PStr('Cluster')],[Node('Version',[PInt(100)]),Node('UserData',[PStr(''),PStr('')]),Node('Indexes',[AInt(cluster_indices.get(i,[]))]),Node('Weights',[ADouble(cluster_weights.get(i,[]))]),Node('Transform',[ADouble(fbx_matrix_from_col(mesh_in_bone_space))]),Node('TransformLink',[ADouble(fbx_matrix_from_col(bone_bind))]),Node('TransformAssociateModel',[ADouble(identity())])]))
+    pose_children=[Node('Type',[PStr('BindPose')]),Node('Version',[PInt(100)]),Node('NbPoseNodes',[PInt(BONE_COUNT)])]
     for i in range(BONE_COUNT): pose_children.append(Node('PoseNode',children=[Node('Node',[PLong(BONE_MODEL_BASE+i)]),Node('Matrix',[ADouble(fbx_matrix_from_col(scaled_col_global[i]))])]))
     pose=Node('Pose',[PLong(POSE_ID),PStr(f'Pose::{asset}_BindPose'),PStr('BindPose')],pose_children)
     animation_objects=[]; animation_connections=[]; anim_curve_count=anim_curve_node_count=anim_stack_count=anim_layer_count=0; anim_manifest=[]
@@ -1124,47 +1205,60 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
             times=[times[0], times[0]+(1.0/60.0)]
             vals=[vals[0], vals[0]]
         n=len(vals)
-        return Node('AnimationCurve',[PLong(cid),PStr(f'AnimCurve::{name}'),PStr('')],[Node('Default',[PDouble(0.0)]),Node('KeyVer',[PInt(4008)]),Node('KeyTime',[ALong([int(round(t*FBX_TICKS_PER_SECOND)) for t in times])]),Node('KeyValueFloat',[AFloat([float(v) for v in vals])]),Node('KeyAttrFlags',[AInt([24840])]),Node('KeyAttrDataFloat',[AFloat([0,0,0,0])]),Node('KeyAttrRefCount',[AInt([n])])])
+        return Node('AnimationCurve',[PLong(cid),PObjectName(name,'AnimCurve'),PStr('')],[Node('Default',[PDouble(0.0)]),Node('KeyVer',[PInt(4008)]),Node('KeyTime',[ALong([int(round(t*FBX_TICKS_PER_SECOND)) for t in times])]),Node('KeyValueFloat',[AFloat([float(v) for v in vals])]),Node('KeyAttrFlags',[AInt([24840])]),Node('KeyAttrDataFloat',[AFloat([0,0,0,0])]),Node('KeyAttrRefCount',[AInt([n])])])
 
     for ai,a in enumerate(animations):
         sid=ANIM_ID_BASE+ai*10000+1; lid=ANIM_ID_BASE+ai*10000+2
-        animation_objects += [Node('AnimationStack',[PLong(sid),PStr(f'AnimStack::{a["name"]}'),PStr('')],[Node('Properties70',children=[p_time('LocalStart',0),p_time('LocalStop',int(round(a['duration']*FBX_TICKS_PER_SECOND))),p_time('ReferenceStart',0),p_time('ReferenceStop',int(round(a['duration']*FBX_TICKS_PER_SECOND)))])]), Node('AnimationLayer',[PLong(lid),PStr(f'AnimLayer::{a["name"]}_Layer'),PStr('')])]
+        animation_objects += [Node('AnimationStack',[PLong(sid),PObjectName(a['name'],'AnimStack'),PStr('')],[Node('Properties70',children=[p_time('LocalStart',0),p_time('LocalStop',int(round(a['duration']*FBX_TICKS_PER_SECOND))),p_time('ReferenceStart',0),p_time('ReferenceStop',int(round(a['duration']*FBX_TICKS_PER_SECOND)))])]), Node('AnimationLayer',[PLong(lid),PObjectName('Layer','AnimLayer'),PStr('')])]
         anim_stack_count+=1; anim_layer_count+=1; animation_connections.append(Node('C',[PStr('OO'),PLong(lid),PLong(sid)])); man_tracks=[]
         for ti,tr in enumerate(a['tracks']):
-            bone=tr['bone']; bname=bone_names[bone]; times=[k[0] for k in tr['keys']]; quats=[k[1] for k in tr['keys']]
-            if times and times[0]>1e-7: times=[0.0]+times; quats=[quats[0]]+quats
-            src_key_count=len(times)
-            times,quats=sample_quat_keys(times,quats,a.get('duration',0.0),fps=60.0)
-            root_stabilized=False
-            fbx_pose_delta_from_bind=False
-            if ANIM_PREVIEW_MODE == 'root_stabilized' and bone == 0 and 0 in skeleton:
-                quats=stabilize_root_quats_to_bind(quats, skeleton[0]['q'])
-                root_stabilized=True
-            elif ANIM_PREVIEW_MODE == 'bind_delta':
-                bind_q=skeleton[bone]['q'] if bone in skeleton else (0,0,0,1)
-                quats=[native_abs_to_blender_pose_delta_quat(q, bind_q) for q in quats]
-                fbx_pose_delta_from_bind=True
-            eulers=unwrap_eulers([quat_to_euler_xyz_degrees(q) for q in quats])
-            cnode_id=ANIM_ID_BASE+ai*10000+100+ti
-            cnode=Node('AnimationCurveNode',[PLong(cnode_id),PStr(f'AnimCurveNode::{a["name"]}_{bname}_R'),PStr('')],[Node('Properties70',children=[p_node('d|X','Number','','A',0.0),p_node('d|Y','Number','','A',0.0),p_node('d|Z','Number','','A',0.0)])])
-            animation_objects.append(cnode); anim_curve_node_count+=1; animation_connections += [Node('C',[PStr('OO'),PLong(cnode_id),PLong(lid)]),Node('C',[PStr('OP'),PLong(cnode_id),PLong(BONE_MODEL_BASE+bone),PStr('Lcl Rotation')])]
-            for axis,idx in [('X',0),('Y',1),('Z',2)]:
-                cid=ANIM_ID_BASE+ai*10000+1000+ti*10+idx
-                animation_objects.append(make_curve(cid,f'{a["name"]}_{bname}_R_{axis}',times,[e[idx] for e in eulers])); animation_connections.append(Node('C',[PStr('OP'),PLong(cid),PLong(cnode_id),PStr(f'd|{axis}')]))
-            man_tracks.append({'bone_id':bone,'bone_name':bname,'layout':tr['layout'],'record_count':tr['count'],'source_key_count':src_key_count,'exported_key_count':len(times),'baked_quaternion_slerp_60fps':True,'fbx_preview_mode':ANIM_PREVIEW_MODE,'fbx_pose_delta_from_bind':fbx_pose_delta_from_bind,'fbx_root_stabilized_to_bind':root_stabilized})
-        anim_manifest.append({'resource_id':a['rid'],'name':a['name'],'duration_seconds':a['duration'],'track_count':len(man_tracks),'exported_tracks':man_tracks})
-    objects=Node('Objects',children=[geometry,mesh_model,material]+texture_nodes+video_nodes+bone_models+bone_attrs+[skin]+clusters+[pose]+animation_objects)
-    con=[Node('C',[PStr('OO'),PLong(MODEL_ID),PLong(0)]),Node('C',[PStr('OO'),PLong(GEOM_ID),PLong(MODEL_ID)]),Node('C',[PStr('OO'),PLong(MAT_ID),PLong(MODEL_ID)])]
-    for i,(_,_,prop) in enumerate(tex_bindings): con += [Node('C',[PStr('OP'),PLong(TEX_ID_BASE+i),PLong(MAT_ID),PStr(prop)]),Node('C',[PStr('OO'),PLong(VID_ID_BASE+i),PLong(TEX_ID_BASE+i)])]
-    for i in range(BONE_COUNT): con.append(Node('C',[PStr('OO'),PLong(BONE_ATTR_BASE+i),PLong(BONE_MODEL_BASE+i)])); con.append(Node('C',[PStr('OO'),PLong(BONE_MODEL_BASE+i),PLong(BONE_MODEL_BASE+parent[i] if parent[i]>=0 else 0)]))
+            bone=int(tr['bone']); bname=bone_names[bone]; track_manifest={'bone_id':bone,'bone_name':bname}
+            channels=[]
+            translation_keys=tr.get('translation_keys') or []
+            if translation_keys:
+                source_times=[key[0] for key in translation_keys]; source_values=[key[1] for key in translation_keys]
+                times,values=sample_vector_keys(source_times,source_values,a.get('duration',0.0),fps=60.0)
+                channels.append(('T','Lcl Translation',times,values))
+                track_manifest['translation_source_key_count']=len(source_times)
+                track_manifest['translation_exported_key_count']=len(times)
+            rotation_keys=tr.get('rotation_keys') or []
+            if rotation_keys:
+                source_times=[key[0] for key in rotation_keys]; quats=[key[1] for key in rotation_keys]
+                times,quats=sample_quat_keys(source_times,quats,a.get('duration',0.0),fps=60.0)
+                if ANIM_PREVIEW_MODE == 'root_stabilized' and bone == 0 and 0 in skeleton:
+                    quats=stabilize_root_quats_to_bind(quats,skeleton[0]['q'])
+                elif ANIM_PREVIEW_MODE == 'bind_delta':
+                    bind_q=skeleton[bone]['q'] if bone in skeleton else (0,0,0,1)
+                    quats=[native_abs_to_blender_pose_delta_quat(q,bind_q) for q in quats]
+                values=unwrap_eulers([quat_to_euler_xyz_degrees(q) for q in quats])
+                channels.append(('R','Lcl Rotation',times,values))
+                track_manifest['rotation_layout']=tr.get('rotation_layout')
+                track_manifest['rotation_source_key_count']=len(source_times)
+                track_manifest['rotation_exported_key_count']=len(times)
+                track_manifest['baked_quaternion_slerp_60fps']=True
+            for channel_index,(channel_name,property_name,times,values) in enumerate(channels):
+                cnode_id=ANIM_ID_BASE+ai*10000+100+ti*2+channel_index
+                cnode=Node('AnimationCurveNode',[PLong(cnode_id),PObjectName(f'{a["name"]}_{bname}_{channel_name}','AnimCurveNode'),PStr('')],[Node('Properties70',children=[p_node('d|X','Number','','A',0.0),p_node('d|Y','Number','','A',0.0),p_node('d|Z','Number','','A',0.0)])])
+                animation_objects.append(cnode); anim_curve_node_count+=1; animation_connections += [Node('C',[PStr('OO'),PLong(cnode_id),PLong(lid)]),Node('C',[PStr('OP'),PLong(cnode_id),PLong(BONE_MODEL_BASE+bone),PStr(property_name)])]
+                for axis,idx in [('X',0),('Y',1),('Z',2)]:
+                    cid=ANIM_ID_BASE+ai*10000+1000+ti*20+channel_index*10+idx
+                    animation_objects.append(make_curve(cid,f'{a["name"]}_{bname}_{channel_name}_{axis}',times,[value[idx] for value in values])); animation_connections.append(Node('C',[PStr('OP'),PLong(cid),PLong(cnode_id),PStr(f'd|{axis}')]))
+            man_tracks.append(track_manifest)
+        if not a.get('_synthetic_rest'):
+            anim_manifest.append({'resource_id':a['resource_id'],'name':a['name'],'duration_seconds':a['duration'],'track_count':len(man_tracks),'exported_tracks':man_tracks})
+    objects=Node('Objects',children=[geometry,group_model,mesh_model]+materials+texture_nodes+video_nodes+bone_models+bone_attrs+[skin]+clusters+[pose]+animation_objects)
+    con=[Node('C',[PStr('OO'),PLong(GROUP_ID),PLong(0)]),Node('C',[PStr('OO'),PLong(MODEL_ID),PLong(GROUP_ID)]),Node('C',[PStr('OO'),PLong(GEOM_ID),PLong(MODEL_ID)])]
+    for material_index in range(len(materials)): con.append(Node('C',[PStr('OO'),PLong(MAT_ID+material_index),PLong(MODEL_ID)]))
+    for i,(_,_,prop,material_index) in enumerate(tex_bindings): con += [Node('C',[PStr('OP'),PLong(TEX_ID_BASE+i),PLong(MAT_ID+material_index),PStr(prop)]),Node('C',[PStr('OO'),PLong(VID_ID_BASE+i),PLong(TEX_ID_BASE+i)])]
+    for i in range(BONE_COUNT): con.append(Node('C',[PStr('OO'),PLong(BONE_ATTR_BASE+i),PLong(BONE_MODEL_BASE+i)])); con.append(Node('C',[PStr('OO'),PLong(BONE_MODEL_BASE+i),PLong(BONE_MODEL_BASE+parent[i] if parent[i]>=0 else GROUP_ID)]))
     con.append(Node('C',[PStr('OO'),PLong(SKIN_ID),PLong(GEOM_ID)]))
     for i in range(BONE_COUNT): con += [Node('C',[PStr('OO'),PLong(CLUSTER_BASE+i),PLong(SKIN_ID)]),Node('C',[PStr('OO'),PLong(BONE_MODEL_BASE+i),PLong(CLUSTER_BASE+i)])]
     con.extend(animation_connections); connections=Node('Connections',children=con)
     def objtype(n,c): return Node('ObjectType',[PStr(n)],[Node('Count',[PInt(c)])])
-    definitions=Node('Definitions',children=[Node('Version',[PInt(100)]),Node('Count',[PInt(3+len(texture_nodes)+len(video_nodes)+BONE_COUNT*3+2+len(animation_objects))]),objtype('Model',1+BONE_COUNT),objtype('Geometry',1),objtype('Material',1),objtype('Texture',len(texture_nodes)),objtype('Video',len(video_nodes)),objtype('NodeAttribute',BONE_COUNT),objtype('Deformer',1+BONE_COUNT),objtype('Pose',1),objtype('AnimationStack',anim_stack_count),objtype('AnimationLayer',anim_layer_count),objtype('AnimationCurveNode',anim_curve_node_count),objtype('AnimationCurve',anim_curve_count)])
+    definitions=Node('Definitions',children=[Node('Version',[PInt(100)]),Node('Count',[PInt(3+len(materials)+len(texture_nodes)+len(video_nodes)+BONE_COUNT*3+2+len(animation_objects))]),objtype('Model',2+BONE_COUNT),objtype('Geometry',1),objtype('Material',len(materials)),objtype('Texture',len(texture_nodes)),objtype('Video',len(video_nodes)),objtype('NodeAttribute',BONE_COUNT),objtype('Deformer',1+BONE_COUNT),objtype('Pose',1),objtype('AnimationStack',anim_stack_count),objtype('AnimationLayer',anim_layer_count),objtype('AnimationCurveNode',anim_curve_node_count),objtype('AnimationCurve',anim_curve_count)])
     global_settings=Node('GlobalSettings',children=[Node('Version',[PInt(1000)]),Node('Properties70',children=[p_node('UpAxis','int','Integer','',2),p_node('UpAxisSign','int','Integer','',1),p_node('FrontAxis','int','Integer','',1),p_node('FrontAxisSign','int','Integer','',-1),p_node('CoordAxis','int','Integer','',0),p_node('CoordAxisSign','int','Integer','',1),p_node('UnitScaleFactor','double','Number','',1.0),p_node('OriginalUnitScaleFactor','double','Number','',1.0)])])
     header=Node('FBXHeaderExtension',children=[Node('FBXHeaderVersion',[PInt(1003)]),Node('FBXVersion',[PInt(7400)]),Node('EncryptionType',[PInt(0)]),Node('Creator',[PStr('BDG to FBX v20 exact-native raw animation import; conservative FBX preview')])])
-    takes_children=[Node('Current',[PStr('')])]
+    takes_children=[Node('Current',[PStr(animations[0]['name'] if animations else '')])]
     for a in animations:
         ticks=int(round(a['duration']*FBX_TICKS_PER_SECOND)); takes_children.append(Node('Take',[PStr(a['name'])],[Node('FileName',[PStr(f'{a["name"]}.tak')]),Node('LocalTime',[PLong(0),PLong(ticks)]),Node('ReferenceTime',[PLong(0),PLong(ticks)])]))
     f=io.BytesIO(); f.write(b'Kaydara FBX Binary  \x00\x1a\x00'); f.write(struct.pack('<I',7400))
@@ -1174,7 +1268,7 @@ def make_fbx(asset,outdir,vertices,normals,uvs,poly_indices,vertex_weights,skele
     return {'animation_manifest':anim_manifest,'weighted_bones':len([i for i in range(BONE_COUNT) if cluster_indices.get(i)]),'fbx':f'{asset}.fbx'}
 
 
-def extract_one(base,shape,anim,pvms,root,force=False):
+def extract_one(base,shape,anim,pvms,root,force=False,include_fbx_animations=True,force_body_material=False):
     asset=base.replace(' ','_')
     out=root/f'{base}-Kaiju-Extracted'
     if out.exists():
@@ -1182,7 +1276,11 @@ def extract_one(base,shape,anim,pvms,root,force=False):
         else: raise ValueError(f'Output exists: {out}')
     out.mkdir(parents=True)
     D=shape.read_bytes(); st_off,st_count,strings=find_strtab(D); skel_base,skel_root,skeleton=find_skeleton(D,strings)
-    bone_count=max(skeleton)+1; bone_names=[skeleton[i]['name'] for i in range(bone_count)]; parent={i:skeleton[i]['parent'] for i in range(bone_count)}
+    # Keep the native value separately so animation-lock writeback never has to
+    # infer which quaternion representation the FBX manifest contains.
+    for bone in skeleton.values():
+        bone['native_q']=tuple(bone['q'])
+    bone_count=max(skeleton)+1; bone_names=[str(skeleton[i]['name']).strip() for i in range(bone_count)]; parent={i:skeleton[i]['parent'] for i in range(bone_count)}
     col_global={}
     def comp(i):
         if i in col_global: return col_global[i]
@@ -1192,8 +1290,12 @@ def extract_one(base,shape,anim,pvms,root,force=False):
     for i in range(bone_count): comp(i)
     global_pos={i:(col_global[i][0][3],col_global[i][1][3],col_global[i][2][3]) for i in range(bone_count)}
     submeshes,skipped=choose_meshes(D,bone_count)
-    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; face_count=0; mesh_stats=[]
+    shape_parser=PipeworksParser(str(shape)); shape_entries=shape_parser.parse()
+    material_names=[str(entry['name']).split('/',1)[-1] for entry in shape_entries if entry.get('file_type')==6 and not entry.get('is_resource')]
+    if not material_names: material_names=[f'{asset}_Material']
+    vertices=[]; normals=[]; uvs=[]; vertex_weights=[]; face_materials=[]; face_count=0; mesh_stats=[]
     for si,sm in enumerate(submeshes):
+        material_index=0 if force_body_material else min(len(material_names)-1, si*len(material_names)//max(1,len(submeshes)))
         for face in sm['faces']:
             ids=[]
             for idx in face:
@@ -1201,6 +1303,7 @@ def extract_one(base,shape,anim,pvms,root,force=False):
                 pos,uv,nrm,wts=parse_vertex_by_layout(D,off,bone_count,sm['layout'])
                 p=tuple(map(float,pos)); t=tuple(map(float,uv)); nn=tuple(map(float,nrm))
                 ids.append(len(vertices)); vertices.append(p); uvs.append(t); normals.append(nn); vertex_weights.append(wts)
+            face_materials.append(material_index)
             face_count+=1
         sm_positions=[]
         for vi in range(sm['v_count']):
@@ -1209,13 +1312,24 @@ def extract_one(base,shape,anim,pvms,root,force=False):
             sm_positions.append(pos)
         bbox={'min':[min(p[i] for p in sm_positions) for i in range(3)],'max':[max(p[i] for p in sm_positions) for i in range(3)]}
         mesh_stats.append({'submesh':si,'layout':sm['layout'],'display_list_start':hex(sm['dl_start']),'display_list_end':hex(sm['dl_end']),'vertex_start':hex(sm['v_start']),'vertex_stride':sm['v_stride'],'vertex_count':sm['v_count'],'triangle_faces':len(sm['faces']),'validation_score':sm['validation_score'],'index_width':sm.get('index_width',6),'bounds':bbox})
-    tex_manifest,tex_bindings=decode_textures(D,strings,out,asset)
-    animations=[]; animation_resource_locations=[]
-    vertices,normals,uvs,vertex_weights,poly_indices,duplicate_seam_faces_skipped = _filter_duplicate_seam_faces(vertices,normals,uvs,vertex_weights)
+    tex_manifest,tex_bindings=decode_textures(D,strings,out,asset,material_names)
+    animations=[]; animation_resource_locations=[]; animation_decoder_report=None
+    if anim:
+        animations,animation_resource_locations,animation_decoder_report=decode_bdg_animations(anim,skeleton,BDG_FBX_EXPORT_SCALE,out)
+    vertices,normals,uvs,vertex_weights,poly_indices,face_materials,duplicate_seam_faces_skipped = _filter_duplicate_seam_faces(vertices,normals,uvs,vertex_weights,face_materials)
     face_count = len(poly_indices) // 3
-    fbxinfo=make_fbx(asset,out,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,animations)
-    manifest={'source_shapes':shape.name,'source_anim':None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'fbx_export_scale':BDG_FBX_EXPORT_SCALE,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'duplicate_seam_faces_skipped':duplicate_seam_faces_skipped,'debug_obj_exports':[],'animation_preview_mode':'disabled_shapes_only','import_scope':'Importer patches same-topology mesh streams and textures by default. Skeleton rest-pose writeback is opt-in with --with-skeleton to avoid Blender FBX axis conversion rotating monsters in-game.'}
-    manifest['bones']=[{'idx':i,'name':bone_names[i],'parent':parent[i],'local_translation':skeleton[i]['t'],'local_quaternion_xyzw':skeleton[i]['q'],'global_position':global_pos[i]} for i in range(bone_count)]
+    fbx_animations=animations if include_fbx_animations else []
+    fbxinfo=make_fbx(asset,out,vertices,normals,uvs,poly_indices,vertex_weights,skeleton,bone_names,parent,col_global,global_pos,tex_bindings,fbx_animations,material_names,face_materials)
+    action_baseline=None
+    fbx_bone_translation_baseline=None
+    if fbx_animations:
+        from animation_baseline import build_action_baseline
+        action_baseline='animation_action_baseline_v1.json.gz'
+        expected_names=[str(animation['name']) for animation in fbx_animations]
+        baseline_result=build_action_baseline(out/fbxinfo['fbx'], expected_names, out/action_baseline)
+        fbx_bone_translation_baseline=baseline_result.get('bone_translations')
+    manifest={'source_shapes':shape.name,'source_anim':anim.name if anim else None,'string_table_offset':hex(st_off),'skeleton_base':hex(skel_base),'skeleton_root':hex(skel_root),'bone_count':bone_count,'mesh_stats':mesh_stats,'skipped_mesh_candidates':skipped,'materials':material_names,'face_material_counts':dict(collections.Counter(face_materials)),'textures':tex_manifest,'animations':fbxinfo['animation_manifest'],'animation_resource_locations':animation_resource_locations,'animation_decoder':animation_decoder_report,'fbx_export_scale':BDG_FBX_EXPORT_SCALE,'triangles':face_count,'control_points':len(vertices),'weighted_bones':fbxinfo['weighted_bones'],'fbx':fbxinfo['fbx'],'animation_action_baseline':action_baseline,'fbx_bone_translation_baseline':fbx_bone_translation_baseline,'duplicate_seam_faces_skipped':duplicate_seam_faces_skipped,'debug_obj_exports':[],'animation_preview_mode':(ANIM_PREVIEW_MODE if include_fbx_animations else 'metadata_only_no_fbx_curves') if anim else 'disabled_shapes_only_no_character_bdg','animation_export_scope':'Native Wii Type-4 translation and quaternion rotation tracks from the character BDG are exported into FBX Actions. PVM files are optional texture companions and are not animation dependencies.','import_scope':'Importer patches same-topology mesh streams, textures, changed skeleton local positions, edited FBX Actions, and deleted-bone native animation locks when animation BDG data is available.'}
+    manifest['bones']=[{'idx':i,'name':bone_names[i],'parent':parent[i],'local_translation':skeleton[i]['t'],'local_quaternion_xyzw':skeleton[i]['q'],'native_local_quaternion_xyzw':skeleton[i].get('native_q',skeleton[i]['q']),'global_position':global_pos[i]} for i in range(bone_count)]
     def _sha256_file(path):
         h=hashlib.sha256()
         with open(path,'rb') as f:
@@ -1225,10 +1339,6 @@ def extract_one(base,shape,anim,pvms,root,force=False):
     manifest['file_hashes']={fbxinfo['fbx']:_sha256_file(out/fbxinfo['fbx'])}
     for tex in sorted((out/'textures').glob('*.png')):
         manifest['file_hashes'][f'textures/{tex.name}']=_sha256_file(tex)
-    raw_dir=out/'animations_raw'
-    if raw_dir.exists():
-        for raw in sorted(raw_dir.iterdir()):
-            if raw.is_file(): manifest['file_hashes'][f'animations_raw/{raw.name}']=_sha256_file(raw)
     (out/'import_log.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
     for p in pvms:
         try: shutil.copy2(p,out/p.name)
@@ -1240,12 +1350,13 @@ def main():
     ap.add_argument('folder',nargs='?',default='.')
     ap.add_argument('--all',action='store_true')
     ap.add_argument('--force',action='store_true')
+    ap.add_argument('--no-fbx-animations',action='store_true',help=argparse.SUPPRESS)
     args=ap.parse_args(); root=Path(clean_arg(args.folder)).resolve(); sets=find_sets(root,args.all)
     reports=[]; errors=[]
     for base,shape,anim,pvms in sets:
         print(f'== Extracting {base} ==')
         try:
-            man=extract_one(base,shape,anim,pvms,root,args.force); reports.append({'base':base,'status':'ok','fbx':man['fbx'],'bones':man['bone_count'],'triangles':man['triangles'],'animations':len(man['animations']),'skipped_mesh_candidates':len(man['skipped_mesh_candidates'])})
+            man=extract_one(base,shape,anim,pvms,root,args.force,include_fbx_animations=not args.no_fbx_animations); reports.append({'base':base,'status':'ok','fbx':man['fbx'],'bones':man['bone_count'],'triangles':man['triangles'],'animations':len(man['animations']),'skipped_mesh_candidates':len(man['skipped_mesh_candidates'])})
             print(f'   ok: bones={man["bone_count"]} tris={man["triangles"]} anims={len(man["animations"])} skipped_mesh_candidates={len(man["skipped_mesh_candidates"])}')
         except Exception as e:
             errors.append({'base':base,'status':'error','error':str(e)}); print(f'   ERROR: {e}')
